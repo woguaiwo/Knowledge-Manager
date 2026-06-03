@@ -1,3 +1,4 @@
+' Create a desktop shortcut for Knowledge Manager (distribution/release version)
 Set WshShell = WScript.CreateObject("WScript.Shell")
 strDesktop = WshShell.SpecialFolders("Desktop")
 Set oLink = WshShell.CreateShortcut(strDesktop & "\Knowledge Manager.lnk")
