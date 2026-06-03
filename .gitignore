@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# PyInstaller
+*.manifest
+*.spec
+# 注意：保留 KnowledgeManager.spec 用于构建
+!KnowledgeManager.spec
+
+# User data & local databases
+data.db
+*.db
+backup/
+logs/
+vocab/
+
+# Runtime logs & errors
+error.txt
+*.log
+
+# Agent instructions (project-internal only)
+AGENTS.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
