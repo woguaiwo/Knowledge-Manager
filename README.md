@@ -1,113 +1,111 @@
 # Knowledge Manager
 
-> 一款基于 Python + PySide6 的 Windows 桌面 PDF 知识管理工具，集阅读、批注、词汇收集、AI 解释与测验于一体。
+> A Windows desktop PDF knowledge management tool built with Python + PySide6, integrating reading, annotation, vocabulary collection, AI explanations, and quizzes.
 
-## 功能特性
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-- **PDF 阅读**：基于 PyMuPDF 的高性能渲染，支持缩放、滚动、多页连续浏览
-- **文本批注**：高亮标记、页面笔记，数据持久化到本地 SQLite
-- **词汇收集**：划词收藏，支持批量生成 AI 释义
-- **AI 解释**：对接任意 OpenAI 兼容 API（OpenAI / DeepSeek / Kimi 等），支持流式回复与图文多模态解释
-- **测验模式**：从 Markdown 导入题库，支持分主题练习与答题统计
-- **主题切换**：内置 Dark / Light / Nature 三套主题
+## Features
 
-## 界面预览
+- **PDF Reading**: High-performance rendering powered by PyMuPDF, with zoom, scroll, and continuous multi-page browsing
+- **Annotations**: Text highlighting and per-page notes, persisted to local SQLite
+- **Vocabulary Collection**: Select and collect words, with batch AI definition generation
+- **AI Explanations**: Connect to any OpenAI-compatible API (OpenAI / DeepSeek / Kimi, etc.), supporting streaming responses and multimodal image explanations
+- **Quiz Mode**: Import question banks from Markdown, with topic-based practice and answer statistics
+- **Theme Switching**: Built-in Dark / Light / Nature themes
 
-（截图占位，欢迎补充）
+## Tech Stack
 
-## 技术栈
-
-| 层级 | 技术 |
-|------|------|
-| GUI 框架 | PySide6 >= 6.5.0 |
-| PDF 引擎 | PyMuPDF (fitz) >= 1.23.0 |
+| Layer | Technology |
+|-------|------------|
+| GUI Framework | PySide6 >= 6.5.0 |
+| PDF Engine | PyMuPDF (fitz) >= 1.23.0 |
 | AI API | requests >= 2.31.0 |
-| 数据库 | SQLite3 |
-| 构建工具 | PyInstaller |
-| 语言 | Python 3.x |
+| Database | SQLite3 |
+| Build Tool | PyInstaller |
+| Language | Python 3.x |
 
-## 快速开始
+## Quick Start
 
-### 环境要求
+### Requirements
 
 - Windows 10/11
-- Python 3.12+（推荐）
+- Python 3.12+ (recommended)
 
-### 安装依赖
+### Install Dependencies
 
 ```bash
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
 ```
 
-### 运行（开发调试）
+### Run (Development)
 
 ```bash
-# 无控制台窗口
+# No console window
 run.bat
 
-# 或直接在终端运行
+# Or run directly in terminal
 venv\Scripts\python main.py
 ```
 
-### 构建独立可执行文件
+### Build Standalone Executable
 
 ```bash
 build.bat
 ```
 
-输出目录：`dist\KnowledgeManager\KnowledgeManager.exe`
+Output: `dist\KnowledgeManager\KnowledgeManager.exe`
 
-## 项目结构
+## Project Structure
 
 ```
 Knowledge-Manager/
-├── main.py                  # 入口
-├── requirements.txt         # 依赖
-├── KnowledgeManager.spec    # PyInstaller 配置
-├── build.bat                # Windows 构建脚本
-├── run.bat                  # 启动脚本
-├── icon.ico / icon.png      # 应用图标
-├── design/                  # 设计文档
-├── core/                    # 后端模块
-│   ├── database.py          # SQLite 数据层
-│   ├── api_client.py        # AI API 客户端
-│   ├── pdf_engine.py        # PyMuPDF 封装
-│   ├── quiz_parser.py       # Markdown 题库解析
-│   ├── logger.py            # 日志
-│   ├── theme_colors.py      # 主题配色
-│   └── utils.py             # 工具函数
-└── ui/                      # 前端 Qt 组件
-    ├── main_window.py       # 主窗口
-    ├── pdf_tab_widget.py    # PDF 标签页
-    ├── pdf_scroll_view.py   # PDF 滚动视图
-    ├── quiz_*.py            # 测验模式相关
-    ├── vocab_panel.py       # 词汇面板
-    ├── note_panel.py        # 笔记面板
-    ├── ai_chat_panel.py     # AI 对话面板
-    ├── theme_manager.py     # 主题管理
+├── main.py                  # Entry point
+├── requirements.txt         # Dependencies
+├── KnowledgeManager.spec    # PyInstaller config
+├── build.bat                # Windows build script
+├── run.bat                  # Launch script
+├── icon.ico / icon.png      # App icons
+├── design/                  # Design documents
+├── core/                    # Backend modules
+│   ├── database.py          # SQLite data layer
+│   ├── api_client.py        # AI API client
+│   ├── pdf_engine.py        # PyMuPDF wrapper
+│   ├── quiz_parser.py       # Markdown quiz parser
+│   ├── logger.py            # Logging
+│   ├── theme_colors.py      # Theme palettes
+│   └── utils.py             # Utilities
+└── ui/                      # Frontend Qt widgets
+    ├── main_window.py       # Main window
+    ├── pdf_tab_widget.py    # PDF tabs
+    ├── pdf_scroll_view.py   # PDF scroll view
+    ├── quiz_*.py            # Quiz mode widgets
+    ├── vocab_panel.py       # Vocabulary panel
+    ├── note_panel.py        # Notes panel
+    ├── ai_chat_panel.py     # AI chat panel
+    ├── theme_manager.py     # Theme management
     └── ...
 ```
 
-## 配置 AI 提供商
+## Configure AI Providers
 
-首次运行时，通过 **设置** → **AI 提供商** 添加你的 API Key：
+On first run, add your API Key via **Settings** → **AI Providers**:
 
-- 支持任何 OpenAI 兼容端点
-- 可配置代理、温度、最大 token、是否流式输出
+- Supports any OpenAI-compatible endpoint
+- Configurable proxy, temperature, max tokens, and streaming
 
-## 数据说明
+## Data Notes
 
-- 所有用户数据（高亮、笔记、词汇、AI 提供商配置）存储在项目根目录的 `data.db` 中
-- 应用退出时会自动备份数据库到 `backup/` 目录
-- 导出的词汇文件保存在 `vocab/` 目录
+- All user data (highlights, notes, vocabulary, AI provider configs) is stored in `data.db` in the project root
+- The app automatically backs up the database to `backup/` on exit
+- Exported vocabulary files are saved in `vocab/`
 
-> ⚠️ 本项目为本地单用户工具，API Key 以明文形式存储在本地 SQLite 中，请勿共享数据库文件。
+> ⚠️ This is a local single-user tool. API Keys are stored in plain text in the local SQLite database. Do not share your database file.
 
-## 贡献
+## Contributing
 
-欢迎提交 Issue 或 PR！
+Issues and PRs are welcome!
 
-## 许可证
+## License
 
 [MIT](LICENSE)
