@@ -350,6 +350,44 @@ class HighlightWidget(QWidget):
         super().keyPressEvent(event)
 
 
+class SearchHighlightWidget(QWidget):
+    """
+    Temporary visual overlay for Target Reading search results.
+    Not persisted to the database; cleared when the mode is exited.
+    """
+
+    def __init__(self, x: float, y: float, width: float, height: float, active: bool = False, parent=None):
+        super().__init__(parent)
+        self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self._active = active
+
+    def set_active(self, active: bool):
+        self._active = active
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        # Amber/orange fill; stronger alpha when active
+        fill = QColor(255, 152, 0)
+        fill.setAlpha(180 if self._active else 100)
+        painter.fillRect(self.rect(), fill)
+
+        border = QColor(255, 87, 34)
+        pen = QPen(border)
+        pen.setWidth(3 if self._active else 1)
+        pen.setStyle(Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        if self._active:
+            # Make sure the 3px border stays fully inside the widget
+            rect = rect.adjusted(1, 1, -1, -1)
+        painter.drawRect(rect)
+        painter.end()
+
+
 class PageView(QWidget):
     """
     Displays a single PDF page with an image background and an interactive
@@ -373,6 +411,7 @@ class PageView(QWidget):
         self.link_widgets: list[LinkWidget] = []
         self.highlight_widgets: list[HighlightWidget] = []
         self._selected_highlight: HighlightWidget | None = None
+        self.search_highlight_widgets: list[SearchHighlightWidget] = []
 
         self.image_label = QLabel(self)
         self.image_label.setScaledContents(False)
@@ -841,3 +880,71 @@ class PageView(QWidget):
     def _update_highlight_widgets(self):
         """Rebuild highlight widgets after zoom change."""
         self._load_highlights()
+
+    # ------------------------------------------------------------------ #
+    # Search highlights (Target Reading mode)
+    # ------------------------------------------------------------------ #
+
+    def clear_search_highlights(self):
+        """Remove all temporary search-highlight widgets."""
+        for w in self.search_highlight_widgets:
+            w.setParent(None)
+            w.deleteLater()
+        self.search_highlight_widgets.clear()
+
+    def highlight_search_results(self, quote: str, active: bool = False) -> bool:
+        """
+        Highlight the first occurrence of *quote* on this page.
+        Returns True if a match was found and highlighted.
+        """
+        if not self.word_widgets or not quote:
+            return False
+        quote = quote.strip()
+        # Try exact substring match across word texts first
+        texts = [w.text for w in self.word_widgets]
+        n = len(self.word_widgets)
+        matched_widgets = []
+        for i in range(n):
+            for j in range(i + 1, min(n, i + 40) + 1):
+                snippet = " ".join(texts[i:j])
+                if quote in snippet:
+                    matched_widgets = self.word_widgets[i:j]
+                    break
+            if matched_widgets:
+                break
+
+        if not matched_widgets:
+            # Fallback: try matching any contiguous words that together contain
+            # at least half of the quote words in order.
+            quote_words = quote.split()
+            if len(quote_words) <= 1:
+                return False
+            for i in range(n):
+                acc = []
+                for j in range(i, min(n, i + 40)):
+                    acc.append(self.word_widgets[j].text)
+                    joined = " ".join(acc)
+                    if quote in joined or joined in quote:
+                        matched_widgets = self.word_widgets[i:j + 1]
+                        break
+                if matched_widgets:
+                    break
+
+        if not matched_widgets:
+            return False
+
+        sorted_widgets = sorted(matched_widgets, key=lambda w: (w.y(), w.x()))
+        x0 = min(w.x() for w in sorted_widgets)
+        y0 = min(w.y() for w in sorted_widgets)
+        x1 = max(w.x() + w.width() for w in sorted_widgets)
+        y1 = max(w.y() + w.height() for w in sorted_widgets)
+
+        w = SearchHighlightWidget(x0, y0, x1 - x0, y1 - y0, active=active, parent=self.overlay)
+        w.show()
+        self.search_highlight_widgets.append(w)
+        return True
+
+    def set_active_search_highlight(self, active_widget: SearchHighlightWidget | None):
+        """Mark one search highlight as active and others inactive."""
+        for w in self.search_highlight_widgets:
+            w.set_active(w is active_widget)

@@ -37,6 +37,7 @@ class ActivityBar(QWidget):
     note_toggled = Signal(bool)
     ai_toggled = Signal(bool)
     quiz_toggled = Signal(bool)
+    target_toggled = Signal(bool)
     vocab_context_menu_requested = Signal()
     show_vocab_panel_requested = Signal()
 
@@ -129,6 +130,17 @@ class ActivityBar(QWidget):
         self.btn_quiz.clicked.connect(lambda checked: self.quiz_toggled.emit(checked))
         layout.addWidget(self.btn_quiz)
 
+        # Target Reading Mode button
+        self.btn_target = QPushButton(self)
+        self.btn_target.setIcon(_create_icon("T", QColor(255, 152, 0)))
+        self.btn_target.setIconSize(QSize(32, 32))
+        self.btn_target.setToolTip("Target Reading Mode")
+        self.btn_target.setCheckable(True)
+        self.btn_target.setFixedSize(44, 44)
+        self.btn_target.setStyleSheet(self._btn_style())
+        self.btn_target.clicked.connect(lambda checked: self.target_toggled.emit(checked))
+        layout.addWidget(self.btn_target)
+
         layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
 
         self.setLayout(layout)
@@ -182,6 +194,11 @@ class ActivityBar(QWidget):
         self.btn_quiz.blockSignals(True)
         self.btn_quiz.setChecked(checked)
         self.btn_quiz.blockSignals(False)
+
+    def set_target_checked(self, checked: bool):
+        self.btn_target.blockSignals(True)
+        self.btn_target.setChecked(checked)
+        self.btn_target.blockSignals(False)
 
     def _show_vocab_context_menu(self, pos):
         menu = QMenu(self)

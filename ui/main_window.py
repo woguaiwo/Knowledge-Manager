@@ -28,8 +28,30 @@ from ui.vocab_edit_dialog import VocabEditDialog
 from ui.explain_popup import ExplainPopup
 from ui.note_panel import NotePanel
 from ui.ai_chat_panel import AiChatPanel
+from ui.target_reading_panel import TargetReadingPanel
+from ui.target_reading_popup import TargetReadingPopup
 from ui.quiz_sidebar import QuizSidebar
 from ui.quiz_tab_widget import QuizTabWidget
+
+
+class TargetReadingWorker(QThread):
+    """Background worker for Target Reading AI analysis."""
+    result_ready = QSignal(list)
+    error_ready = QSignal(str)
+
+    def __init__(self, pdf_text: str, question: str, provider: dict):
+        super().__init__()
+        self.pdf_text = pdf_text
+        self.question = question
+        self.provider = provider
+
+    def run(self):
+        try:
+            from core import target_reading
+            results = target_reading.analyze_document(self.pdf_text, self.question, self.provider)
+            self.result_ready.emit(results)
+        except Exception as e:
+            self.error_ready.emit(str(e))
 
 
 class GenerationWorker(QThread):
@@ -125,6 +147,10 @@ class MainWindow(QMainWindow):
         self._gen_worker = None
         self._undo_stack: list[dict] = []
         self._explain_popup = None
+        self._target_popup = None
+        self._target_matches: list[dict] = []
+        self._target_active_index: int = -1
+        self._target_worker = None
 
         self._setup_ui()
         self._setup_toolbar()
@@ -151,6 +177,7 @@ class MainWindow(QMainWindow):
         self.activity_bar.note_toggled.connect(self._toggle_note_mode)
         self.activity_bar.ai_toggled.connect(self._toggle_ai_mode)
         self.activity_bar.quiz_toggled.connect(self._toggle_quiz_mode)
+        self.activity_bar.target_toggled.connect(self._toggle_target_reading_mode)
         hlayout.addWidget(self.activity_bar)
 
         # Vertical divider between ActivityBar and left panel
@@ -194,6 +221,12 @@ class MainWindow(QMainWindow):
         self.ai_chat_panel = AiChatPanel(left_panel)
         self.ai_chat_panel.hide()
         left_layout.addWidget(self.ai_chat_panel)
+
+        # Target Reading panel (shares the same slot as AI chat)
+        self.target_reading_panel = TargetReadingPanel(left_panel)
+        self.target_reading_panel.hide()
+        self.target_reading_panel.query_submitted.connect(self._on_target_reading_query)
+        left_layout.addWidget(self.target_reading_panel)
 
         # Right area: QStackedWidget switches between PDF and Quiz
         self.tab_widget = QTabWidget()
@@ -313,6 +346,10 @@ class MainWindow(QMainWindow):
             self.left_divider.setStyleSheet(f"background-color: {text};")
         if self._explain_popup is not None:
             self._explain_popup.apply_theme(theme_name)
+        if self._target_popup is not None:
+            self._target_popup.apply_theme(theme_name)
+        if hasattr(self, 'target_reading_panel'):
+            self.target_reading_panel.apply_theme(theme_name)
         # Refresh quiz widgets for new theme colors
         self._refresh_quiz_theme()
         # Refresh PDF highlight widgets for new theme colors
@@ -330,21 +367,33 @@ class MainWindow(QMainWindow):
         """Show/hide vertical dividers based on visible panels."""
         colors = get_theme_colors()
         text_color = colors['text']  # white on dark, black on light
-        # Sidebar divider: visible when sidebar is shown alongside quiz or ai
-        show_sidebar_div = self.sidebar.isVisible() and (
-            self.quiz_sidebar.isVisible() or self.ai_chat_panel.isVisible()
+        left_panel_visible = (
+            self.sidebar.isVisible()
+            or self.quiz_sidebar.isVisible()
+            or self.ai_chat_panel.isVisible()
+            or self.target_reading_panel.isVisible()
         )
+        # Sidebar divider: visible when sidebar is shown alongside another left panel
+        show_sidebar_div = self.sidebar.isVisible() and left_panel_visible
         self._left_divider.setVisible(show_sidebar_div)
         self._left_divider.setStyleSheet(f"background: {text_color}; color: {text_color};")
 
-        # Quiz-AI divider: visible when both quiz and ai are shown
-        show_quiz_ai_div = self.quiz_sidebar.isVisible() and self.ai_chat_panel.isVisible()
+        # Quiz-AI divider: visible when quiz and AI/Target panels are both shown
+        show_quiz_ai_div = self.quiz_sidebar.isVisible() and (
+            self.ai_chat_panel.isVisible() or self.target_reading_panel.isVisible()
+        )
         self._quiz_ai_divider.setVisible(show_quiz_ai_div)
         self._quiz_ai_divider.setStyleSheet(f"background: {text_color}; color: {text_color};")
 
     def _update_splitter_sizes(self):
         """Collapse left panel when nothing is visible on the left."""
-        if self.sidebar.isVisible() or self.ai_chat_panel.isVisible() or self.quiz_sidebar.isVisible():
+        left_visible = (
+            self.sidebar.isVisible()
+            or self.ai_chat_panel.isVisible()
+            or self.quiz_sidebar.isVisible()
+            or self.target_reading_panel.isVisible()
+        )
+        if left_visible:
             # Ensure left panel has reasonable width
             if self.splitter.sizes()[0] < 100:
                 total = self.splitter.width()
@@ -440,6 +489,9 @@ class MainWindow(QMainWindow):
             if self._explain_popup:
                 self._explain_popup.hide()
                 self._explain_popup = None
+            self._clear_target_reading_state()
+            self.activity_bar.set_target_checked(False)
+            self.target_reading_panel.hide()
             return
         tab = self.tab_widget.widget(index)
         if not isinstance(tab, PdfTabWidget):
@@ -451,6 +503,9 @@ class MainWindow(QMainWindow):
         self.activity_bar.set_vocab_checked(tab.vocab_mode)
         self.activity_bar.set_explain_checked(tab.explain_mode)
         self.activity_bar.set_note_checked(tab.note_mode)
+        self.activity_bar.set_target_checked(False)
+        self.target_reading_panel.hide()
+        self._clear_target_reading_state()
         self.lbl_zoom.setText(f"{int(tab.zoom * 100)}%")
         if tab.note_mode:
             self.note_dock.show()
@@ -619,6 +674,8 @@ class MainWindow(QMainWindow):
             self.activity_bar.set_vocab_checked(False)
             self.activity_bar.set_explain_checked(False)
             self.activity_bar.set_note_checked(False)
+            self.activity_bar.set_target_checked(False)
+            self.target_reading_panel.hide()
             # Show Quiz (keep AI chat visible if user wants both)
             self.quiz_sidebar.show()
             self.main_stack.setCurrentIndex(1)
@@ -631,6 +688,158 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Quiz Mode: OFF")
         self._update_left_dividers()
         self._update_splitter_sizes()
+
+    def _toggle_target_reading_mode(self, checked: bool):
+        tab = self._current_tab()
+        if checked and tab is None:
+            QMessageBox.warning(self, "Warning", "Please open a PDF first.")
+            self.activity_bar.set_target_checked(False)
+            return
+        if checked:
+            self.target_reading_panel.show()
+            # Mutually exclusive with Explorer and AI Chat
+            self.sidebar.hide()
+            self.ai_chat_panel.hide()
+            self.activity_bar.set_explorer_checked(False)
+            self.activity_bar.set_ai_checked(False)
+            self.status_label.setText("Target Reading Mode: ON")
+        else:
+            self.target_reading_panel.hide()
+            self._clear_target_reading_state()
+            self.status_label.setText("Target Reading Mode: OFF")
+        self._update_left_dividers()
+        self._update_splitter_sizes()
+
+    def _clear_target_reading_state(self):
+        """Remove temporary highlights and close the navigation popup."""
+        tab = self._current_tab()
+        if tab and tab.scroll_view:
+            tab.scroll_view.clear_search_highlights()
+        if self._target_popup is not None:
+            self._target_popup.hide()
+            self._target_popup = None
+        self._target_matches = []
+        self._target_active_index = -1
+
+    def _on_target_reading_query(self, question: str):
+        tab = self._current_tab()
+        if tab is None or tab.engine is None:
+            self.target_reading_panel.set_error("No PDF document loaded.")
+            return
+        provider = self.target_reading_panel.current_provider()
+        if not provider:
+            self.target_reading_panel.set_error("No AI provider selected.")
+            return
+
+        self._clear_target_reading_state()
+        self.target_reading_panel.set_analyzing(True)
+        pdf_text = tab.engine.extract_full_text()
+
+        self._target_worker = TargetReadingWorker(pdf_text, question, provider)
+        self._target_worker.result_ready.connect(self._on_target_analysis_complete)
+        self._target_worker.error_ready.connect(self._on_target_analysis_error)
+        self._target_worker.finished.connect(self._cleanup_target_worker)
+        self._target_worker.start()
+
+    def _cleanup_target_worker(self):
+        self._target_worker = None
+
+    def _on_target_analysis_complete(self, results: list):
+        self.target_reading_panel.set_analyzing(False)
+        if not results:
+            self.target_reading_panel.append_result("No relevant passages found.")
+            return
+
+        tab = self._current_tab()
+        if tab is None or tab.scroll_view is None:
+            return
+
+        # Highlight matches on each page
+        matched = []  # list of (page, quote, explanation, widget)
+        for item in results:
+            page_number = item.get("page", 1) - 1  # convert to 0-based
+            quote = item.get("quote", "")
+            explanation = item.get("explanation", "")
+            if page_number < 0 or page_number >= len(tab.scroll_view.page_views):
+                continue
+            pv = tab.scroll_view.page_views[page_number]
+            if pv.highlight_search_results(quote, active=False):
+                # Store reference to the last created widget for this page
+                widget = pv.search_highlight_widgets[-1] if pv.search_highlight_widgets else None
+                matched.append({
+                    "page": page_number,
+                    "quote": quote,
+                    "explanation": explanation,
+                    "widget": widget,
+                })
+
+        if not matched:
+            self.target_reading_panel.append_result("Found references but could not locate them in the PDF text.")
+            return
+
+        # Sort by page, then by widget position
+        matched.sort(key=lambda m: (m["page"], m["widget"].y() if m["widget"] else 0, m["widget"].x() if m["widget"] else 0))
+        self._target_matches = matched
+        self._target_active_index = 0
+
+        self.target_reading_panel.append_result(f"Found {len(matched)} relevant passage(s).")
+        self._show_target_popup()
+        self._show_target_match(0)
+
+    def _on_target_analysis_error(self, message: str):
+        self.target_reading_panel.set_error(message)
+
+    def _show_target_popup(self):
+        if self._target_popup is not None:
+            self._target_popup.hide()
+        self._target_popup = TargetReadingPopup(self)
+        self._target_popup.prev_requested.connect(self._on_target_prev)
+        self._target_popup.next_requested.connect(self._on_target_next)
+        self._target_popup.close_requested.connect(self._hide_target_popup)
+        self._target_popup.show_near_cursor()
+
+    def _hide_target_popup(self):
+        if self._target_popup is not None:
+            self._target_popup.hide()
+            self._target_popup = None
+
+    def _on_target_prev(self):
+        if not self._target_matches or self._target_active_index <= 0:
+            return
+        self._target_active_index -= 1
+        self._show_target_match(self._target_active_index)
+
+    def _on_target_next(self):
+        if not self._target_matches or self._target_active_index >= len(self._target_matches) - 1:
+            return
+        self._target_active_index += 1
+        self._show_target_match(self._target_active_index)
+
+    def _show_target_match(self, index: int):
+        if not self._target_matches or index < 0 or index >= len(self._target_matches):
+            return
+        match = self._target_matches[index]
+        page_number = match["page"]
+        widget = match["widget"]
+        explanation = match["explanation"]
+
+        tab = self._current_tab()
+        if tab is None or tab.scroll_view is None:
+            return
+
+        # Update active visual state on all pages
+        for pv in tab.scroll_view.page_views:
+            pv.set_active_search_highlight(widget if pv.page_number == page_number else None)
+
+        # Scroll to the match
+        y_offset = widget.y() if widget else 0
+        tab.scroll_view.scroll_to_page(page_number, y_offset)
+
+        # Update popup
+        if self._target_popup is not None:
+            self._target_popup.set_match(index, len(self._target_matches), explanation)
+            self._target_popup.show()
+            self._target_popup.raise_()
 
     def _on_quiz_focus_selected(self):
         self.quiz_tab_widget.setCurrentIndex(0)

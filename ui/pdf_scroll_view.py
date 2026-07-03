@@ -181,6 +181,11 @@ class PdfScrollView(QWidget):
         for pv in self.page_views:
             pv.highlight_mode = active
 
+    def clear_search_highlights(self):
+        """Remove all temporary Target Reading search highlights."""
+        for pv in self.page_views:
+            pv.clear_search_highlights()
+
     def eventFilter(self, watched, event):
         if watched == self.scroll_area.viewport() and event.type() == QEvent.Type.Wheel:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
