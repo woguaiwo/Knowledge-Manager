@@ -385,24 +385,24 @@ class SearchHighlightWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Amber/orange fill; stronger alpha when active
-        fill = QColor(255, 152, 0)
-        fill.setAlpha(180 if self._active else 100)
-
-        border = QColor(255, 87, 34)
-        pen = QPen(border)
-        pen.setWidth(3 if self._active else 1)
-        pen.setStyle(Qt.PenStyle.SolidLine)
+        # Very pale yellow fill; slightly stronger when active
+        fill = QColor(255, 249, 196)
+        fill.setAlpha(95 if self._active else 65)
 
         rects = self.line_rects if self.line_rects else [self.rect()]
         for rect in rects:
             painter.fillRect(rect, fill)
+
+        # Subtle border only for the active match
+        if self._active:
+            border = QColor(251, 192, 45)
+            pen = QPen(border)
+            pen.setWidth(1)
+            pen.setStyle(Qt.PenStyle.SolidLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            draw_rect = rect.adjusted(1, 1, -1, -1)
-            if self._active:
-                draw_rect = draw_rect.adjusted(1, 1, -1, -1)
-            painter.drawRect(draw_rect)
+            for rect in rects:
+                painter.drawRect(rect.adjusted(1, 1, -1, -1))
         painter.end()
 
 
@@ -990,35 +990,42 @@ class PageView(QWidget):
         if not self.word_widgets or not quote:
             return False
         quote = quote.strip()
-        # Try exact substring match across word texts first
         texts = [w.text for w in self.word_widgets]
         n = len(self.word_widgets)
-        matched_widgets = []
-        for i in range(n):
-            for j in range(i + 1, min(n, i + 80) + 1):
-                snippet = " ".join(texts[i:j])
-                if quote in snippet:
-                    matched_widgets = self.word_widgets[i:j]
-                    break
-            if matched_widgets:
-                break
 
-        if not matched_widgets:
-            # Fallback: try matching any contiguous words that together contain
-            # the quote or are contained by it.
-            quote_words = quote.split()
-            if len(quote_words) <= 1:
-                return False
-            for i in range(n):
-                acc = []
-                for j in range(i, min(n, i + 80)):
-                    acc.append(self.word_widgets[j].text)
-                    joined = " ".join(acc)
-                    if quote in joined or joined in quote:
-                        matched_widgets = self.word_widgets[i:j + 1]
-                        break
-                if matched_widgets:
+        # Find the shortest contiguous word window that contains the quote.
+        best_start = -1
+        best_end = -1
+        best_len = float('inf')
+        for i in range(n):
+            snippet = ""
+            for j in range(i, min(n, i + 200)):
+                snippet += (" " if snippet else "") + texts[j]
+                if quote in snippet:
+                    window_len = j - i + 1
+                    if window_len < best_len:
+                        best_len = window_len
+                        best_start = i
+                        best_end = j + 1
                     break
+
+        if best_start >= 0:
+            matched_widgets = self.word_widgets[best_start:best_end]
+        else:
+            # Fallback: find any words that appear in the quote and are close together.
+            quote_lower = quote.lower()
+            candidate_indices = [idx for idx, t in enumerate(texts) if t.lower() in quote_lower]
+            if not candidate_indices:
+                return False
+            # Take the first cluster of candidates within a 40-word window.
+            cluster_start = candidate_indices[0]
+            cluster_end = cluster_start + 1
+            for idx in candidate_indices[1:]:
+                if idx <= cluster_start + 40:
+                    cluster_end = idx + 1
+                else:
+                    break
+            matched_widgets = self.word_widgets[cluster_start:cluster_end]
 
         if not matched_widgets:
             return False
