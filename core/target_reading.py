@@ -11,15 +11,15 @@ from core import api_client
 
 
 _PROMPT_TEMPLATE = (
-    "You are a reading assistant. The user asks a question about a PDF document. "
-    "Find the most relevant passages in the document and return them as a JSON array only.\n\n"
-    "Each item must contain:\n"
-    '- "page": 1-based page number\n'
-    '- "quote": exact text snippet from the document (1-3 sentences)\n'
-    '- "explanation": brief note explaining why this passage is relevant to the question\n\n'
-    "User question: {question}\n\n"
-    "Document content:\n{pdf_text}\n\n"
-    "Return ONLY a JSON array, no markdown code blocks, no extra text."
+    "你是一个阅读助手。用户针对一篇 PDF 文档提出问题，请在文档中找出最相关的段落，"
+    "并以 JSON 数组的形式返回。\n\n"
+    "每个条目必须包含:\n"
+    '- "page": 页码（从 1 开始）\n'
+    '- "quote": 文档中的原文片段（1-3 句话）\n'
+    '- "explanation": 简要说明该段落为何与问题相关\n\n'
+    "用户问题: {question}\n\n"
+    "文档内容:\n{pdf_text}\n\n"
+    "请只返回 JSON 数组，不要添加 markdown 代码块或其他额外文字。"
 )
 
 

@@ -2,8 +2,8 @@
 Custom widgets for PDF page rendering and word-level interaction.
 """
 import random
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPixmap
+from PySide6.QtCore import Qt, Signal, QRect
+from PySide6.QtGui import QColor, QPainter, QPixmap, QPen
 from PySide6.QtWidgets import (
     QWidget, QLabel, QSizePolicy, QApplication
 )
@@ -252,11 +252,14 @@ class HighlightWidget(QWidget):
     highlight_selected = Signal(int)
     highlight_copied = Signal(str)
 
-    def __init__(self, highlight_id: int, color: str, x: float, y: float, width: float, height: float, text: str = "", parent=None):
+    def __init__(self, highlight_id: int, color: str, x: float, y: float, width: float, height: float, text: str = "", line_rects: list = None, unzoomed_rect: tuple = None, parent=None):
         super().__init__(parent)
         self.highlight_id = highlight_id
         self.color = color
         self.text = text
+        self.line_rects = line_rects or []  # list of QRect relative to widget top-left
+        # Store unzoomed bbox for fast geometry updates on rescale
+        self.unzoomed_rect = unzoomed_rect  # (x, y, width, height) in PDF coordinates
         self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -267,6 +270,12 @@ class HighlightWidget(QWidget):
 
     def set_selected(self, selected: bool):
         self._selected = selected
+        self.update()
+
+    def update_geometry(self, x: float, y: float, width: float, height: float, line_rects: list = None):
+        self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
+        if line_rects is not None:
+            self.line_rects = line_rects
         self.update()
 
     def enterEvent(self, event):
@@ -283,7 +292,10 @@ class HighlightWidget(QWidget):
         painter = QPainter(self)
         c = QColor(self.color)
         c.setAlpha(160 if self._selected else (140 if self._hovered else 100))
-        painter.fillRect(self.rect(), c)
+
+        rects = self.line_rects if self.line_rects else [self.rect()]
+        for rect in rects:
+            painter.fillRect(rect, c)
 
         if self._selected:
             colors = get_theme_colors()
@@ -293,21 +305,24 @@ class HighlightWidget(QWidget):
             glow.setAlpha(80)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(glow)
-            painter.drawRect(self.rect().adjusted(-2, -2, 2, 2))
+            for rect in rects:
+                painter.drawRect(rect.adjusted(-2, -2, 2, 2))
             # Solid border inside widget bounds
             pen = QPen(selected_color)
             pen.setWidth(2)
             pen.setStyle(Qt.PenStyle.SolidLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self.rect().adjusted(2, 2, -2, -2))
+            for rect in rects:
+                painter.drawRect(rect.adjusted(2, 2, -2, -2))
         elif self._hovered:
             pen = QPen(QColor(255, 255, 255, 180))
             pen.setWidth(1)
             pen.setStyle(Qt.PenStyle.DotLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self.rect().adjusted(1, 1, -1, -1))
+            for rect in rects:
+                painter.drawRect(rect.adjusted(1, 1, -1, -1))
         painter.end()
 
     def mousePressEvent(self, event):
@@ -356,8 +371,9 @@ class SearchHighlightWidget(QWidget):
     Not persisted to the database; cleared when the mode is exited.
     """
 
-    def __init__(self, x: float, y: float, width: float, height: float, active: bool = False, parent=None):
+    def __init__(self, x: float, y: float, width: float, height: float, active: bool = False, line_rects: list = None, parent=None):
         super().__init__(parent)
+        self.line_rects = line_rects or []
         self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -372,19 +388,21 @@ class SearchHighlightWidget(QWidget):
         # Amber/orange fill; stronger alpha when active
         fill = QColor(255, 152, 0)
         fill.setAlpha(180 if self._active else 100)
-        painter.fillRect(self.rect(), fill)
 
         border = QColor(255, 87, 34)
         pen = QPen(border)
         pen.setWidth(3 if self._active else 1)
         pen.setStyle(Qt.PenStyle.SolidLine)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        rect = self.rect().adjusted(1, 1, -1, -1)
-        if self._active:
-            # Make sure the 3px border stays fully inside the widget
-            rect = rect.adjusted(1, 1, -1, -1)
-        painter.drawRect(rect)
+
+        rects = self.line_rects if self.line_rects else [self.rect()]
+        for rect in rects:
+            painter.fillRect(rect, fill)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            draw_rect = rect.adjusted(1, 1, -1, -1)
+            if self._active:
+                draw_rect = draw_rect.adjusted(1, 1, -1, -1)
+            painter.drawRect(draw_rect)
         painter.end()
 
 
@@ -697,28 +715,64 @@ class PageView(QWidget):
         popup.color_selected.connect(_on_color)
         popup.show_at(global_pos)
 
+    def _build_line_strips(self, words: list[WordWidget]) -> tuple[float, float, float, float, list]:
+        """
+        Group words by (block, line) and build continuous line-strip bboxes.
+        Returns (x0, y0, x1, y1, line_rects) where line_rects are QRects
+        relative to the overall top-left corner (x0, y0).
+        """
+        if not words:
+            return 0, 0, 0, 0, []
+
+        # Group by line, preserving reading order
+        groups: dict[tuple[int, int], list[WordWidget]] = {}
+        order: list[tuple[int, int]] = []
+        for w in words:
+            key = (w.block, w.line)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(w)
+
+        line_rects = []
+        x0 = min(w.x() for w in words)
+        y0 = min(w.y() for w in words)
+        x1 = max(w.x() + w.width() for w in words)
+        y1 = max(w.y() + w.height() for w in words)
+
+        for key in order:
+            group = groups[key]
+            gx0 = min(w.x() for w in group)
+            gy0 = min(w.y() for w in group)
+            gx1 = max(w.x() + w.width() for w in group)
+            gy1 = max(w.y() + w.height() for w in group)
+            # Relative to overall bbox
+            line_rects.append(QRect(int(gx0 - x0), int(gy0 - y0), int(gx1 - gx0) + 1, int(gy1 - gy0) + 1))
+
+        return x0, y0, x1, y1, line_rects
+
     def _apply_highlight(self, color: str):
         if not self.selected_widgets or not self.engine or not self.engine.path:
             return
         sorted_widgets = sorted(self.selected_widgets, key=lambda w: (w.y(), w.x()))
         if not sorted_widgets:
             return
-        # Compute bounding box of selection
-        x0 = min(w.x() for w in sorted_widgets)
-        y0 = min(w.y() for w in sorted_widgets)
-        x1 = max(w.x() + w.width() for w in sorted_widgets)
-        y1 = max(w.y() + w.height() for w in sorted_widgets)
+        x0, y0, x1, y1, line_rects = self._build_line_strips(sorted_widgets)
         texts = " ".join(w.text for w in sorted_widgets)
-        # Save to DB
+        # Save overall bbox to DB
         from core import database
         hid = database.save_highlight(
             self.engine.path, self.page_number, texts,
             x0 / self.zoom, y0 / self.zoom, (x1 - x0) / self.zoom, (y1 - y0) / self.zoom,
             color
         )
-        # Create widget
-        hw = HighlightWidget(hid, color, x0, y0, x1 - x0, y1 - y0, parent=self.overlay)
+        # Create line-strip widget
+        hw = HighlightWidget(
+            hid, color, x0, y0, x1 - x0, y1 - y0,
+            text=texts, line_rects=line_rects, parent=self.overlay
+        )
         hw.highlight_deleted.connect(self._on_highlight_deleted)
+        hw.highlight_selected.connect(self._on_highlight_selected)
         hw.show()
         self.highlight_widgets.append(hw)
         self.clear_selection()
@@ -830,7 +884,7 @@ class PageView(QWidget):
     # ------------------------------------------------------------------ #
 
     def _load_highlights(self):
-        """Load persistent highlights from DB for this page."""
+        """Load persistent highlights from DB for this page as line strips."""
         for hw in self.highlight_widgets:
             hw.setParent(None)
             hw.deleteLater()
@@ -844,20 +898,35 @@ class PageView(QWidget):
         for h in highlights:
             if h["page_number"] != self.page_number:
                 continue
+            ux, uy, uw, uh = h["x"], h["y"], h["width"], h["height"]
+            x0, y0, w0, h0 = ux * self.zoom, uy * self.zoom, uw * self.zoom, uh * self.zoom
+            words = self._words_in_rect(x0, y0, w0, h0)
+            _, _, _, _, line_rects = self._build_line_strips(words) if words else (x0, y0, x0 + w0, y0 + h0, [QRect(0, 0, int(w0) + 1, int(h0) + 1)])
             hw = HighlightWidget(
                 highlight_id=h["id"],
                 color=h["color"],
-                x=h["x"] * self.zoom,
-                y=h["y"] * self.zoom,
-                width=h["width"] * self.zoom,
-                height=h["height"] * self.zoom,
+                x=x0,
+                y=y0,
+                width=w0,
+                height=h0,
                 text=h.get("text", ""),
+                line_rects=line_rects,
+                unzoomed_rect=(ux, uy, uw, uh),
                 parent=self.overlay,
             )
             hw.highlight_deleted.connect(self._on_highlight_deleted)
             hw.highlight_selected.connect(self._on_highlight_selected)
             hw.show()
             self.highlight_widgets.append(hw)
+
+    def _words_in_rect(self, x: float, y: float, width: float, height: float) -> list[WordWidget]:
+        """Return word widgets whose geometry intersects the given rect."""
+        rect = QRect(int(x), int(y), int(width) + 1, int(height) + 1)
+        result = []
+        for w in self.word_widgets:
+            if rect.intersects(w.geometry()):
+                result.append(w)
+        return result
 
     def _on_highlight_selected(self, highlight_id: int):
         """Mutually exclusive highlight selection."""
@@ -878,8 +947,29 @@ class PageView(QWidget):
         self._load_highlights()
 
     def _update_highlight_widgets(self):
-        """Rebuild highlight widgets after zoom change."""
-        self._load_highlights()
+        """Update highlight widget geometries after zoom change without full rebuild."""
+        if not self.engine or not self.engine.path:
+            return
+        # If counts mismatch (e.g. words not rebuilt yet), fall back to full load
+        if not self.word_widgets:
+            self._load_highlights()
+            return
+
+        to_remove = []
+        for hw in self.highlight_widgets:
+            if hw.unzoomed_rect is None:
+                to_remove.append(hw)
+                continue
+            ux, uy, uw, uh = hw.unzoomed_rect
+            x0, y0, w0, h0 = ux * self.zoom, uy * self.zoom, uw * self.zoom, uh * self.zoom
+            words = self._words_in_rect(x0, y0, w0, h0)
+            _, _, _, _, line_rects = self._build_line_strips(words) if words else (x0, y0, x0 + w0, y0 + h0, [QRect(0, 0, int(w0) + 1, int(h0) + 1)])
+            hw.update_geometry(x0, y0, w0, h0, line_rects)
+
+        for hw in to_remove:
+            hw.setParent(None)
+            hw.deleteLater()
+            self.highlight_widgets.remove(hw)
 
     # ------------------------------------------------------------------ #
     # Search highlights (Target Reading mode)
@@ -894,7 +984,7 @@ class PageView(QWidget):
 
     def highlight_search_results(self, quote: str, active: bool = False) -> bool:
         """
-        Highlight the first occurrence of *quote* on this page.
+        Highlight the first occurrence of *quote* on this page as line strips.
         Returns True if a match was found and highlighted.
         """
         if not self.word_widgets or not quote:
@@ -905,7 +995,7 @@ class PageView(QWidget):
         n = len(self.word_widgets)
         matched_widgets = []
         for i in range(n):
-            for j in range(i + 1, min(n, i + 40) + 1):
+            for j in range(i + 1, min(n, i + 80) + 1):
                 snippet = " ".join(texts[i:j])
                 if quote in snippet:
                     matched_widgets = self.word_widgets[i:j]
@@ -915,13 +1005,13 @@ class PageView(QWidget):
 
         if not matched_widgets:
             # Fallback: try matching any contiguous words that together contain
-            # at least half of the quote words in order.
+            # the quote or are contained by it.
             quote_words = quote.split()
             if len(quote_words) <= 1:
                 return False
             for i in range(n):
                 acc = []
-                for j in range(i, min(n, i + 40)):
+                for j in range(i, min(n, i + 80)):
                     acc.append(self.word_widgets[j].text)
                     joined = " ".join(acc)
                     if quote in joined or joined in quote:
@@ -933,13 +1023,11 @@ class PageView(QWidget):
         if not matched_widgets:
             return False
 
-        sorted_widgets = sorted(matched_widgets, key=lambda w: (w.y(), w.x()))
-        x0 = min(w.x() for w in sorted_widgets)
-        y0 = min(w.y() for w in sorted_widgets)
-        x1 = max(w.x() + w.width() for w in sorted_widgets)
-        y1 = max(w.y() + w.height() for w in sorted_widgets)
-
-        w = SearchHighlightWidget(x0, y0, x1 - x0, y1 - y0, active=active, parent=self.overlay)
+        x0, y0, x1, y1, line_rects = self._build_line_strips(matched_widgets)
+        w = SearchHighlightWidget(
+            x0, y0, x1 - x0, y1 - y0,
+            active=active, line_rects=line_rects, parent=self.overlay
+        )
         w.show()
         self.search_highlight_widgets.append(w)
         return True
