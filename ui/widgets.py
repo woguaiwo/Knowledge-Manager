@@ -2,7 +2,7 @@
 Custom widgets for PDF page rendering and word-level interaction.
 """
 import random
-from PySide6.QtCore import Qt, Signal, QRect
+from PySide6.QtCore import Qt, Signal, QRect, QPoint
 from PySide6.QtGui import QColor, QPainter, QPixmap, QPen
 from PySide6.QtWidgets import (
     QWidget, QLabel, QSizePolicy, QApplication
@@ -388,11 +388,16 @@ class AnnotationIconWidget(QWidget):
 
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
+        print(f"[DEBUG] AnnotationIconWidget enterEvent CALLED: id={self.annotation_id}")
+        print(f"[DEBUG]   note_text='{self.note_text}', visible={self.isVisible()}, enabled={self.isEnabled()}")
+        print(f"[DEBUG]   geometry={self.geometry()}, parent={self.parent()}")
         # Create tooltip with parent for proper window management
         if self._tooltip is None:
             self._tooltip = InstantTooltip(self.window())
+            print(f"[DEBUG]   Created InstantTooltip")
         display = self.note_text if self.note_text else "(Double-click to add note)"
         self._tooltip.show_at(display, QCursor.pos())
+        print(f"[DEBUG]   Tooltip shown at {QCursor.pos()}")
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
@@ -508,6 +513,7 @@ class HighlightWidget(QWidget):
     def enterEvent(self, event):
         self._hovered = True
         self.update()
+        print(f"[DEBUG] HighlightWidget enterEvent CALLED: id={self.highlight_id}, annotation_text='{self.annotation_text}'")
         if self.annotation_text:
             from PySide6.QtGui import QCursor
             if self._tooltip is None:
@@ -687,6 +693,7 @@ class PageView(QWidget):
         self.overlay = QWidget(self)
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.overlay.setStyleSheet("background: transparent;")
+        self.overlay.setMouseTracking(True)  # Enable hover events for children
         # Click on empty area clears selection; double-click on empty area captures whole page
         self.overlay.mousePressEvent = self._on_overlay_press
         self.overlay.mouseMoveEvent = self._on_overlay_move
@@ -772,7 +779,9 @@ class PageView(QWidget):
         widget.delete_requested.connect(self._on_annotation_delete_requested)
         widget.moved.connect(self._on_annotation_moved)
         widget.show()
+        widget.raise_()  # Ensure it's on top of overlay children
         self.annotation_widgets.append(widget)
+        print(f"[DEBUG] Created annotation widget: id={annot_id}, visible={widget.isVisible()}, pos=({pdf_x},{pdf_y})")
         return widget
 
     def _on_annotation_delete_requested(self, annot_id: int):
@@ -805,6 +814,7 @@ class PageView(QWidget):
             return
         from core import database
         annotations = database.get_annotations(self.engine.path, self.page_number)
+        print(f"[DEBUG] load_annotations for page {self.page_number}: found {len(annotations)} annotations")
         for annot in annotations:
             if annot["target_type"] == "icon":
                 self._create_annotation_widget(
@@ -864,6 +874,7 @@ class PageView(QWidget):
         event.accept()
 
     def load_page(self):
+        print(f"[DEBUG] load_page called for page {self.page_number}")
         image = self.engine.render_page(self.page_number, self.zoom)
         if image is None:
             return
