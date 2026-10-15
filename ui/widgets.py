@@ -237,18 +237,19 @@ class LinkWidget(QWidget):
 
 class InstantTooltip(QLabel):
     """Custom tooltip with zero delay - shows/hides instantly."""
-    _instance = None
 
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
-            Qt.WindowType.ToolTip |
+            Qt.WindowType.Window |
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.NoDropShadowWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setStyleSheet(
             "QLabel {"
             "background: rgba(60, 60, 60, 240);"
@@ -261,22 +262,13 @@ class InstantTooltip(QLabel):
         )
         self.hide()
 
-    @classmethod
-    def show_instant(cls, text: str, global_pos):
-        """Show tooltip instantly at cursor position."""
-        if cls._instance is None:
-            cls._instance = InstantTooltip()
-        cls._instance.setText(text)
-        cls._instance.adjustSize()
-        cls._instance.move(global_pos + QPoint(16, 16))
-        cls._instance.show()
-        cls._instance.raise_()
-
-    @classmethod
-    def hide_instant(cls):
-        """Hide tooltip instantly."""
-        if cls._instance is not None:
-            cls._instance.hide()
+    def show_at(self, text: str, global_pos):
+        """Show tooltip instantly at given position."""
+        self.setText(text)
+        self.adjustSize()
+        self.move(global_pos + QPoint(16, 16))
+        self.show()
+        self.raise_()
 
 
 class AnnotationIconWidget(QWidget):
@@ -398,16 +390,26 @@ class AnnotationIconWidget(QWidget):
 
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
-        # Show instant tooltip - no delay
+        # Create tooltip instance if needed
+        if not hasattr(self, '_tooltip') or self._tooltip is None:
+            self._tooltip = InstantTooltip()
         display = self.note_text if self.note_text else "(Double-click to add note)"
-        InstantTooltip.show_instant(display, QCursor.pos())
+        self._tooltip.show_at(display, QCursor.pos())
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        InstantTooltip.hide_instant()
+        if hasattr(self, '_tooltip') and self._tooltip is not None:
+            self._tooltip.hide()
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Update tooltip position when cursor moves while hovering
+        if hasattr(self, '_tooltip') and self._tooltip is not None and self._tooltip.isVisible():
+            from PySide6.QtGui import QCursor
+            self._tooltip.move(QCursor.pos() + QPoint(16, 16))
+        super().mouseMoveEvent(event)
 
 
 class HighlightWidget(QWidget):
@@ -509,16 +511,26 @@ class HighlightWidget(QWidget):
         self.update()
         if self.annotation_text:
             from PySide6.QtGui import QCursor
-            InstantTooltip.show_instant(self.annotation_text, QCursor.pos())
+            if not hasattr(self, '_tooltip') or self._tooltip is None:
+                self._tooltip = InstantTooltip()
+            self._tooltip.show_at(self.annotation_text, QCursor.pos())
             self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hovered = False
         self.update()
-        InstantTooltip.hide_instant()
+        if hasattr(self, '_tooltip') and self._tooltip is not None:
+            self._tooltip.hide()
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Update tooltip position when cursor moves while hovering
+        if hasattr(self, '_tooltip') and self._tooltip is not None and self._tooltip.isVisible():
+            from PySide6.QtGui import QCursor
+            self._tooltip.move(QCursor.pos() + QPoint(16, 16))
+        super().mouseMoveEvent(event)
 
     def set_annotation_text(self, text: str):
         """Set attached annotation text and update visual indicator."""
