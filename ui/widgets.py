@@ -1121,6 +1121,9 @@ class PageView(QWidget):
         )
         hw.highlight_deleted.connect(self._on_highlight_deleted)
         hw.highlight_selected.connect(self._on_highlight_selected)
+        hw.annotation_edit_requested.connect(self._on_hw_annotation_edit)
+        hw.annotation_hover_entered.connect(self._on_hw_annotation_hover)
+        hw.annotation_hover_left.connect(self._on_hw_annotation_leave)
         hw.show()
         self.highlight_widgets.append(hw)
         self.clear_selection()
@@ -1272,12 +1275,28 @@ class PageView(QWidget):
             )
             hw.highlight_deleted.connect(self._on_highlight_deleted)
             hw.highlight_selected.connect(self._on_highlight_selected)
+            # Forward annotation signals to PageView level
+            hw.annotation_edit_requested.connect(self._on_hw_annotation_edit)
+            hw.annotation_hover_entered.connect(self._on_hw_annotation_hover)
+            hw.annotation_hover_left.connect(self._on_hw_annotation_leave)
             # Load annotation for this highlight if exists
             annot = database.get_annotation_for_target(self.engine.path, "highlight", h["id"])
             if annot:
                 hw.set_annotation_text(annot["note_text"])
             hw.show()
             self.highlight_widgets.append(hw)
+
+    def _on_hw_annotation_edit(self, highlight_id: int, global_pos):
+        """Forward highlight annotation edit to PageView signal."""
+        self.annotation_edit_requested.emit(highlight_id, global_pos)
+
+    def _on_hw_annotation_hover(self, highlight_id: int, text: str, global_pos):
+        """Forward highlight annotation hover to PageView signal."""
+        self.annotation_hover_entered.emit(highlight_id, text, global_pos)
+
+    def _on_hw_annotation_leave(self, highlight_id: int):
+        """Forward highlight annotation leave to PageView signal."""
+        self.annotation_hover_left.emit(highlight_id)
 
     def _words_in_rect(self, x: float, y: float, width: float, height: float) -> list[WordWidget]:
         """Return word widgets whose geometry intersects the given rect."""
