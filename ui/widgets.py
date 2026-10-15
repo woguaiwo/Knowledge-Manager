@@ -235,6 +235,50 @@ class LinkWidget(QWidget):
         event.accept()
 
 
+class InstantTooltip(QLabel):
+    """Custom tooltip with zero delay - shows/hides instantly."""
+    _instance = None
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.ToolTip |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.NoDropShadowWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet(
+            "QLabel {"
+            "background: rgba(60, 60, 60, 240);"
+            "color: #ffffff;"
+            "border: 1px solid #555555;"
+            "border-radius: 4px;"
+            "padding: 6px 10px;"
+            "font-size: 12px;"
+            "}"
+        )
+        self.hide()
+
+    @classmethod
+    def show_instant(cls, text: str, global_pos):
+        """Show tooltip instantly at cursor position."""
+        if cls._instance is None:
+            cls._instance = InstantTooltip()
+        cls._instance.setText(text)
+        cls._instance.adjustSize()
+        cls._instance.move(global_pos + QPoint(16, 16))
+        cls._instance.show()
+        cls._instance.raise_()
+
+    @classmethod
+    def hide_instant(cls):
+        """Hide tooltip instantly."""
+        if cls._instance is not None:
+            cls._instance.hide()
+
+
 class AnnotationIconWidget(QWidget):
     """
     Small icon placed on PDF page for annotations.
@@ -258,6 +302,8 @@ class AnnotationIconWidget(QWidget):
         # Do NOT set tooltip here - we handle it manually in enterEvent
         self._drag_start = None
         self._dragging = False
+        # Custom instant tooltip (no delay)
+        self._tooltip = None
 
     def update_geometry(self, x: float, y: float, width: float, height: float):
         self.setGeometry(int(x), int(y), int(width), int(height))
@@ -352,20 +398,14 @@ class AnnotationIconWidget(QWidget):
 
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
-        from PySide6.QtWidgets import QToolTip
-        # Force clear previous tooltip state to avoid cooldown
-        QToolTip.hideText()
-        # Show tooltip directly - most reliable approach
+        # Show instant tooltip - no delay
         display = self.note_text if self.note_text else "(Double-click to add note)"
-        QToolTip.showText(QCursor.pos(), display, self)
-        # Also emit signal for compatibility
+        InstantTooltip.show_instant(display, QCursor.pos())
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        from PySide6.QtWidgets import QToolTip
-        # Force immediate hide
-        QToolTip.hideText()
+        InstantTooltip.hide_instant()
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
 
@@ -469,18 +509,14 @@ class HighlightWidget(QWidget):
         self.update()
         if self.annotation_text:
             from PySide6.QtGui import QCursor
-            from PySide6.QtWidgets import QToolTip
-            # Force clear previous tooltip state to avoid cooldown
-            QToolTip.hideText()
-            QToolTip.showText(QCursor.pos(), self.annotation_text, self)
+            InstantTooltip.show_instant(self.annotation_text, QCursor.pos())
             self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hovered = False
         self.update()
-        from PySide6.QtWidgets import QToolTip
-        QToolTip.hideText()
+        InstantTooltip.hide_instant()
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
 
