@@ -284,9 +284,15 @@ def init_db():
                 title TEXT NOT NULL,
                 parent_id INTEGER DEFAULT 0,
                 sort_order INTEGER DEFAULT 0,
+                entry_type TEXT DEFAULT 'bookmark',
                 created_at TEXT NOT NULL
             )
         """)
+        # Migrate old bookmarks table that lacks entry_type
+        cursor = conn.execute("PRAGMA table_info(bookmarks)")
+        bm_cols = [row['name'] for row in cursor.fetchall()]
+        if 'entry_type' not in bm_cols:
+            conn.execute("ALTER TABLE bookmarks ADD COLUMN entry_type TEXT DEFAULT 'bookmark'")
         conn.commit()
 
 
@@ -1000,8 +1006,8 @@ def delete_highlight(highlight_id: int) -> bool:
 # Bookmarks
 # ---------------------------------------------------------------------------
 
-def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0) -> int:
-    """Add a bookmark and return its id."""
+def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0, entry_type: str = "bookmark") -> int:
+    """Add a bookmark or keyword and return its id."""
     with _get_conn() as conn:
         # Get max sort_order for this parent to append at end
         cursor = conn.execute(
@@ -1013,26 +1019,26 @@ def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0
         new_order = max_order + 1
 
         cursor = conn.execute(
-            "INSERT INTO bookmarks (pdf_path, page_number, title, parent_id, sort_order, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (pdf_path, page_number, title, parent_id, new_order, datetime.now().isoformat())
+            "INSERT INTO bookmarks (pdf_path, page_number, title, parent_id, sort_order, entry_type, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pdf_path, page_number, title, parent_id, new_order, entry_type, datetime.now().isoformat())
         )
         conn.commit()
         return cursor.lastrowid
 
 
 def get_bookmarks(pdf_path: str) -> List[Dict]:
-    """Get all bookmarks for a PDF, ordered by parent_id and sort_order."""
+    """Get all bookmarks/keywords for a PDF, ordered by parent_id and sort_order."""
     with _get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, pdf_path, page_number, title, parent_id, sort_order, created_at "
+            "SELECT id, pdf_path, page_number, title, parent_id, sort_order, entry_type, created_at "
             "FROM bookmarks WHERE pdf_path = ? ORDER BY parent_id, sort_order",
             (pdf_path,)
         ).fetchall()
         return [dict(row) for row in rows]
 
 
-def update_bookmark(bookmark_id: int, title: str = None, parent_id: int = None, sort_order: int = None):
+def update_bookmark(bookmark_id: int, title: str = None, parent_id: int = None, sort_order: int = None, entry_type: str = None):
     """Update bookmark fields."""
     with _get_conn() as conn:
         updates = []
@@ -1046,6 +1052,9 @@ def update_bookmark(bookmark_id: int, title: str = None, parent_id: int = None, 
         if sort_order is not None:
             updates.append("sort_order = ?")
             params.append(sort_order)
+        if entry_type is not None:
+            updates.append("entry_type = ?")
+            params.append(entry_type)
         if not updates:
             return
         params.append(bookmark_id)

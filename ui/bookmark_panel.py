@@ -62,7 +62,11 @@ class BookmarkTreeWidget(QTreeWidget):
         def _add_items(parent_item, parent_id):
             for bm in by_parent.get(parent_id, []):
                 item = QTreeWidgetItem(parent_item)
-                item.setText(0, f"📄 {bm['title']} (p.{bm['page_number'] + 1})")
+                entry_type = bm.get("entry_type", "bookmark")
+                if entry_type == "keyword":
+                    item.setText(0, f"🏷️ {bm['title']}")
+                else:
+                    item.setText(0, f"📄 {bm['title']} (p.{bm['page_number'] + 1})")
                 item.setData(0, Qt.ItemDataRole.UserRole, bm)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 _add_items(item, bm["id"])
@@ -77,9 +81,9 @@ class BookmarkTreeWidget(QTreeWidget):
         self.editItem(item, column)
 
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int):
-        """Emit bookmark_clicked when item is clicked."""
+        """Emit bookmark_clicked when a bookmark (not keyword) is clicked."""
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        if data:
+        if data and data.get("entry_type", "bookmark") == "bookmark":
             self.bookmark_clicked.emit(data["page_number"])
 
     def _show_context_menu(self, pos):
@@ -99,12 +103,16 @@ class BookmarkTreeWidget(QTreeWidget):
 
         if item:
             data = item.data(0, Qt.ItemDataRole.UserRole)
+            entry_type = data.get("entry_type", "bookmark")
             act_rename = menu.addAction("✏️ Rename")
             act_rename.triggered.connect(lambda: self._rename_item(item))
             act_delete = menu.addAction("🗑 Delete")
             act_delete.triggered.connect(lambda: self._delete_item(item))
+            menu.addSeparator()
             act_add_child = menu.addAction("➕ Add Child Bookmark")
-            act_add_child.triggered.connect(lambda: self._add_child_item(item))
+            act_add_child.triggered.connect(lambda: self._add_child_item(item, "bookmark"))
+            act_add_keyword = menu.addAction("🏷️ Add Keyword")
+            act_add_keyword.triggered.connect(lambda: self._add_child_item(item, "keyword"))
             menu.addSeparator()
             act_move_up = menu.addAction("⬆ Move Up")
             act_move_up.triggered.connect(lambda: self._move_item(item, -1))
@@ -112,7 +120,9 @@ class BookmarkTreeWidget(QTreeWidget):
             act_move_down.triggered.connect(lambda: self._move_item(item, 1))
         else:
             act_add_root = menu.addAction("➕ Add Root Bookmark")
-            act_add_root.triggered.connect(lambda: self._add_root_item())
+            act_add_root.triggered.connect(lambda: self._add_root_item("bookmark"))
+            act_add_root_keyword = menu.addAction("🏷️ Add Root Keyword")
+            act_add_root_keyword.triggered.connect(lambda: self._add_root_item("keyword"))
 
         menu.exec(self.viewport().mapToGlobal(pos))
 
@@ -139,35 +149,35 @@ class BookmarkTreeWidget(QTreeWidget):
             self.set_pdf(self._current_pdf)  # Reload
             self.structure_changed.emit()
 
-    def _add_child_item(self, item: QTreeWidgetItem):
-        """Add a child bookmark under the selected item."""
+    def _add_child_item(self, item: QTreeWidgetItem, entry_type: str = "bookmark"):
+        """Add a child bookmark or keyword under the selected item."""
         parent_data = item.data(0, Qt.ItemDataRole.UserRole)
-        # Need current page number - will be set by parent panel
-        title, ok = QInputDialog.getText(
-            self, "Add Child Bookmark", "Bookmark title:"
-        )
+        dialog_title = "Add Child Keyword" if entry_type == "keyword" else "Add Child Bookmark"
+        label = "Keyword text:" if entry_type == "keyword" else "Bookmark title:"
+        title, ok = QInputDialog.getText(self, dialog_title, label)
         if ok and title.strip():
-            # page_number will be set by BookmarkPanel when adding
             database.add_bookmark(
                 self._current_pdf,
-                0,  # Placeholder, should be set by caller
+                0,  # page_number placeholder
                 title.strip(),
-                parent_id=parent_data["id"]
+                parent_id=parent_data["id"],
+                entry_type=entry_type
             )
             self.set_pdf(self._current_pdf)
             self.structure_changed.emit()
 
-    def _add_root_item(self):
-        """Add a root-level bookmark."""
-        title, ok = QInputDialog.getText(
-            self, "Add Bookmark", "Bookmark title:"
-        )
+    def _add_root_item(self, entry_type: str = "bookmark"):
+        """Add a root-level bookmark or keyword."""
+        dialog_title = "Add Keyword" if entry_type == "keyword" else "Add Bookmark"
+        label = "Keyword text:" if entry_type == "keyword" else "Bookmark title:"
+        title, ok = QInputDialog.getText(self, dialog_title, label)
         if ok and title.strip():
             database.add_bookmark(
                 self._current_pdf,
-                0,  # Placeholder
+                0,  # page_number placeholder
                 title.strip(),
-                parent_id=0
+                parent_id=0,
+                entry_type=entry_type
             )
             self.set_pdf(self._current_pdf)
             self.structure_changed.emit()
@@ -203,9 +213,9 @@ class BookmarkTreeWidget(QTreeWidget):
         for i in range(root.childCount()):
             _save_item(root.child(i), 0, i)
 
-    def add_bookmark_for_page(self, page_number: int, title: str, parent_id: int = 0):
+    def add_bookmark_for_page(self, page_number: int, title: str, parent_id: int = 0, entry_type: str = "bookmark"):
         """Add a bookmark for a specific page."""
-        database.add_bookmark(self._current_pdf, page_number, title, parent_id)
+        database.add_bookmark(self._current_pdf, page_number, title, parent_id, entry_type)
         self.set_pdf(self._current_pdf)
         self.structure_changed.emit()
 
@@ -304,6 +314,7 @@ class BookmarkPanel(QWidget):
                 result.append({
                     "title": child["title"],
                     "page_number": child["page_number"],
+                    "entry_type": child.get("entry_type", "bookmark"),
                     "children": _build_tree(child["id"])
                 })
             return result
@@ -356,8 +367,9 @@ class BookmarkPanel(QWidget):
             for item in items:
                 title = item.get("title", "Untitled")
                 page = item.get("page_number", 0)
+                entry_type = item.get("entry_type", "bookmark")
                 new_id = database.add_bookmark(
-                    self._current_pdf, page, title, parent_id
+                    self._current_pdf, page, title, parent_id, entry_type
                 )
                 children = item.get("children", [])
                 if children:
