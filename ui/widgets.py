@@ -235,48 +235,6 @@ class LinkWidget(QWidget):
         event.accept()
 
 
-class InstantTooltip(QLabel):
-    """Custom tooltip with zero delay - shows/hides instantly, no animations."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowFlags(
-            Qt.WindowType.Tool |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.NoDropShadowWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)  # Prevent auto-delete
-        self.setStyleSheet(
-            "QLabel {"
-            "background: rgba(60, 60, 60, 240);"
-            "color: #ffffff;"
-            "border: 1px solid #555555;"
-            "border-radius: 4px;"
-            "padding: 6px 10px;"
-            "font-size: 12px;"
-            "}"
-        )
-        # Disable any animations
-        self.setWindowOpacity(1.0)
-
-    def show_at(self, text: str, global_pos):
-        """Show tooltip instantly at given position."""
-        self.setText(text)
-        self.adjustSize()
-        self.move(global_pos + QPoint(16, 16))
-        self.show()
-        self.raise_()
-
-    def hide(self):
-        """Hide immediately without any fade animation."""
-        self.setWindowOpacity(0.0)  # Force fully transparent first
-        super().hide()
-
-
 class AnnotationIconWidget(QWidget):
     """
     Small icon placed on PDF page for annotations.
@@ -297,11 +255,10 @@ class AnnotationIconWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        # Do NOT set tooltip here - we handle it manually in enterEvent
         self._drag_start = None
         self._dragging = False
-        # Custom instant tooltip (no delay)
-        self._tooltip = None
+        # Floating label for hover display (child widget, not a separate window)
+        self._hover_label = None
 
     def update_geometry(self, x: float, y: float, width: float, height: float):
         self.setGeometry(int(x), int(y), int(width), int(height))
@@ -396,22 +353,34 @@ class AnnotationIconWidget(QWidget):
 
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
-        print(f"[DEBUG] AnnotationIconWidget enterEvent CALLED: id={self.annotation_id}")
-        print(f"[DEBUG]   note_text='{self.note_text}', visible={self.isVisible()}, enabled={self.isEnabled()}")
-        print(f"[DEBUG]   geometry={self.geometry()}, parent={self.parent()}")
-        # Create tooltip with parent for proper window management
-        if self._tooltip is None:
-            self._tooltip = InstantTooltip(self.window())
-            print(f"[DEBUG]   Created InstantTooltip")
+        # Create hover label as child widget (no window system delay)
+        if self._hover_label is None:
+            self._hover_label = QLabel(self.parentWidget())
+            self._hover_label.setStyleSheet(
+                "QLabel {"
+                "background: rgba(60, 60, 60, 240);"
+                "color: #ffffff;"
+                "border: 1px solid #555555;"
+                "border-radius: 4px;"
+                "padding: 6px 10px;"
+                "font-size: 12px;"
+                "}"
+            )
+            self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         display = self.note_text if self.note_text else "(Double-click to add note)"
-        self._tooltip.show_at(display, QCursor.pos())
-        print(f"[DEBUG]   Tooltip shown at {QCursor.pos()}")
+        self._hover_label.setText(display)
+        self._hover_label.adjustSize()
+        # Position next to the icon
+        local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
+        self._hover_label.move(local_pos + QPoint(28, 0))
+        self._hover_label.show()
+        self._hover_label.raise_()
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        if self._tooltip is not None:
-            self._tooltip.hide()  # Just hide, overlay will handle cleanup
+        if self._hover_label is not None:
+            self._hover_label.hide()
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
 
@@ -452,7 +421,7 @@ class HighlightWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._hovered = False
         self._selected = False
-        self._tooltip = None  # lazy-init in enterEvent
+        self._hover_label = None  # child widget for hover display
 
     def set_selected(self, selected: bool):
         self._selected = selected
@@ -521,28 +490,45 @@ class HighlightWidget(QWidget):
     def enterEvent(self, event):
         self._hovered = True
         self.update()
-        print(f"[DEBUG] HighlightWidget enterEvent CALLED: id={self.highlight_id}, annotation_text='{self.annotation_text}'")
         if self.annotation_text:
             from PySide6.QtGui import QCursor
-            if self._tooltip is None:
-                self._tooltip = InstantTooltip(self.window())
-            self._tooltip.show_at(self.annotation_text, QCursor.pos())
+            # Create hover label as child widget (no window system delay)
+            if self._hover_label is None:
+                self._hover_label = QLabel(self.parentWidget())
+                self._hover_label.setStyleSheet(
+                    "QLabel {"
+                    "background: rgba(60, 60, 60, 240);"
+                    "color: #ffffff;"
+                    "border: 1px solid #555555;"
+                    "border-radius: 4px;"
+                    "padding: 6px 10px;"
+                    "font-size: 12px;"
+                    "}"
+                )
+                self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._hover_label.setText(self.annotation_text)
+            self._hover_label.adjustSize()
+            # Position next to the highlight
+            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
+            self._hover_label.move(local_pos + QPoint(10, -30))
+            self._hover_label.show()
+            self._hover_label.raise_()
             self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hovered = False
         self.update()
-        if self._tooltip is not None:
-            self._tooltip.hide()  # Just hide, overlay will handle cleanup
+        if self._hover_label is not None:
+            self._hover_label.hide()
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event):
-        # Update tooltip position when cursor moves while hovering
-        if hasattr(self, '_tooltip') and self._tooltip is not None and self._tooltip.isVisible():
-            from PySide6.QtGui import QCursor
-            self._tooltip.move(QCursor.pos() + QPoint(16, 16))
+        # Update hover label position when cursor moves while hovering
+        if self._hover_label is not None and self._hover_label.isVisible():
+            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
+            self._hover_label.move(local_pos + QPoint(10, -30))
         super().mouseMoveEvent(event)
 
     def set_annotation_text(self, text: str):
@@ -880,13 +866,13 @@ class PageView(QWidget):
         self._hide_all_tooltips()
 
     def _hide_all_tooltips(self):
-        """Hide all annotation tooltips immediately."""
+        """Hide all hover labels immediately."""
         for widget in self.annotation_widgets:
-            if widget._tooltip is not None:
-                widget._tooltip.hide()
+            if widget._hover_label is not None:
+                widget._hover_label.hide()
         for hw in self.highlight_widgets:
-            if hw._tooltip is not None:
-                hw._tooltip.hide()
+            if hw._hover_label is not None:
+                hw._hover_label.hide()
 
     def _on_overlay_release(self, event):
         if self.selection_active:
