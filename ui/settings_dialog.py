@@ -8,6 +8,8 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog,
     QCheckBox
 )
+
+from ui.prompt_edit_dialog import PromptEditDialog
 from PySide6.QtCore import Qt
 
 from core import database
@@ -186,6 +188,18 @@ class SettingsDialog(QDialog):
 
         layout.addSpacing(10)
 
+        # --- AI Prompts ---
+        prompts_layout = QHBoxLayout()
+        prompts_layout.addWidget(QLabel("🧠 AI Prompts"))
+        prompts_layout.addStretch()
+        self.btn_edit_prompts = QPushButton("✏️ Edit Prompts")
+        self.btn_edit_prompts.setToolTip("View and customize the prompts sent to AI models")
+        self.btn_edit_prompts.clicked.connect(self._edit_prompts)
+        prompts_layout.addWidget(self.btn_edit_prompts)
+        layout.addLayout(prompts_layout)
+
+        layout.addSpacing(10)
+
         # --- Bottom buttons ---
         btn_layout = QHBoxLayout()
         self.btn_save = QPushButton("Save All")
@@ -315,6 +329,10 @@ class SettingsDialog(QDialog):
         database.update_ai_provider(pid, is_default=True)
         self._providers = database.get_all_ai_providers()
         self._refresh_provider_list()
+
+    def _edit_prompts(self):
+        dlg = PromptEditDialog(parent=self)
+        dlg.exec()
 
     def _save(self):
         database.save_setting("theme", self.combo_theme.currentData())

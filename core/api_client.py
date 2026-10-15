@@ -55,22 +55,11 @@ def build_prompt(words_data: List[Dict]) -> str:
         else:
             lines.append(f'- "{word}"')
 
-    prompt = (
-        "You are a helpful language-learning assistant. "
-        "For each word or phrase below, provide a detailed explanation that includes BOTH definition AND interpretation.\n\n"
-        "Requirements:\n"
-        "1. Combine the provided context to explain the meaning.\n"
-        "2. Include both an English explanation and a Chinese explanation.\n"
-        "3. The explanation should not just be a dictionary definition; explain how the word/phrase is used in the given context.\n\n"
-        "Return the result as a JSON array in this exact format:\n"
-        '[\n'
-        '  {"word": "...", "explanation_en": "...", "explanation_cn": "..."},\n'
-        '  ...\n'
-        ']\n\n'
-        "Words/Phrases to explain:\n" + "\n".join(lines) + "\n\n"
-        "Return ONLY the JSON array, no markdown code blocks, no extra text."
-    )
-    return prompt
+    cfg = prompt_manager.get_prompt("prompt_definition")
+    user_template = cfg.get("user")
+    if not user_template:
+        user_template = prompt_manager.DEFAULT_PROMPTS["prompt_definition"]["user"]
+    return user_template.format(words="\n".join(lines))
 
 
 def generate_definitions(
@@ -100,7 +89,7 @@ def generate_definitions(
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant specialized in language learning."},
+            {"role": "system", "content": prompt_manager.get_prompt("prompt_definition").get("system", "")},
             {"role": "user", "content": prompt}
         ],
         "temperature": temperature,

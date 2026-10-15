@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QComboBox, QLineEdit, QTextEdit,
     QDialogButtonBox, QProgressDialog, QGroupBox
 )
-from core import database, api_client
+from core import database, api_client, prompt_manager
 from core.logger import get_logger
 from core.theme_colors import get_theme_colors
 
@@ -428,31 +428,13 @@ class QuizSidebar(QWidget):
         return text
 
     def _ai_parse_quiz(self, text: str, provider: dict) -> list:
-        prompt = (
-            "You are a quiz parser. Extract all questions from the following markdown content.\n"
-            "Return ONLY a JSON array in this exact format (no markdown code fences, no extra text):\n"
-            '[\n'
-            '  {\n'
-            '    "number": 1,\n'
-            '    "text": "question text in markdown",\n'
-            '    "options": {"A": "option A text", "B": "option B text", ...},\n'
-            '    "correct_answer": "B",\n'
-            '    "explanation": "explanation text, can be empty string",\n'
-            '    "is_multiple_choice": false\n'
-            '  }\n'
-            ']\n'
-            "For multiple-choice questions, correct_answer may contain multiple letters like 'A,C'.\n"
-            "Set is_multiple_choice to true when there are multiple correct answers.\n"
-            "If a question lacks an explanation, use empty string.\n"
-            "IMPORTANT: If any text contains LaTeX math with backslashes (like \\frac, \\sum), "
-            "the backslashes inside JSON string values MUST be doubled (\\ -> \\\\ ) so they survive JSON parsing.\n\n"
-            "Markdown content:\n"
-            "---\n"
-            f"{text}\n"
-            "---"
-        )
+        cfg = prompt_manager.get_prompt("prompt_quiz_parser")
+        user_template = cfg.get("user")
+        if not user_template:
+            user_template = prompt_manager.DEFAULT_PROMPTS["prompt_quiz_parser"]["user"]
+        prompt = user_template.format(content=text)
         messages = [
-            {"role": "system", "content": "You are a precise quiz extraction assistant. Output only valid JSON."},
+            {"role": "system", "content": cfg.get("system", "")},
             {"role": "user", "content": prompt},
         ]
         result = api_client.explain_chat(

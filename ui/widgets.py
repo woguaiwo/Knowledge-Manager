@@ -74,17 +74,10 @@ class WordWidget(QWidget):
         if self.mask_enabled and not self.revealed:
             painter.fillRect(self.rect(), QColor(30, 30, 30))
         elif self.selected:
-            pv = self._get_page_view()
-            if pv and pv.highlight_mode:
-                # Highlight mode: brighter selection with glow border
-                painter.fillRect(self.rect(), QColor(100, 200, 255, 220))
-                pen = painter.pen()
-                pen.setColor(QColor(255, 255, 255, 200))
-                pen.setWidth(1)
-                painter.setPen(pen)
-                painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
-            else:
-                painter.fillRect(self.rect(), QColor(66, 165, 245, 180))
+            # Selection highlight is rendered by SelectionStripWidget so the
+            # text underneath stays fully readable. Keep WordWidget itself
+            # visually transparent.
+            painter.fillRect(self.rect(), QColor(255, 255, 255, 1))
         elif self.collected:
             painter.fillRect(self.rect(), QColor(255, 235, 59, 120))
         else:
@@ -290,24 +283,20 @@ class HighlightWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        c = QColor(self.color)
-        c.setAlpha(160 if self._selected else (140 if self._hovered else 100))
-
         rects = self.line_rects if self.line_rects else [self.rect()]
+
+        # Marker-style underline: colour only the bottom part of each line so
+        # the text above remains perfectly readable.
+        marker = QColor(self.color)
+        marker.setAlpha(160 if self._selected else (130 if self._hovered else 100))
         for rect in rects:
-            painter.fillRect(rect, c)
+            h = max(3, int(rect.height() * 0.35))
+            underline = QRect(rect.x(), rect.y() + rect.height() - h, rect.width(), h)
+            painter.fillRect(underline, marker)
 
         if self._selected:
             colors = get_theme_colors()
             selected_color = QColor(colors.get("selected", "#3a5a8a"))
-            # Outer glow / shadow for stronger visual feedback
-            glow = QColor(selected_color)
-            glow.setAlpha(80)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(glow)
-            for rect in rects:
-                painter.drawRect(rect.adjusted(-2, -2, 2, 2))
-            # Solid border inside widget bounds
             pen = QPen(selected_color)
             pen.setWidth(2)
             pen.setStyle(Qt.PenStyle.SolidLine)
@@ -385,9 +374,10 @@ class SearchHighlightWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Very pale yellow fill; slightly stronger when active
+        # Soft yellow marker rendered behind the text overlay, so it can be
+        # a bit more saturated without hurting readability.
         fill = QColor(255, 249, 196)
-        fill.setAlpha(95 if self._active else 65)
+        fill.setAlpha(120 if self._active else 80)
 
         rects = self.line_rects if self.line_rects else [self.rect()]
         for rect in rects:
@@ -403,6 +393,28 @@ class SearchHighlightWidget(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             for rect in rects:
                 painter.drawRect(rect.adjusted(1, 1, -1, -1))
+        painter.end()
+
+
+class SelectionStripWidget(QWidget):
+    """
+    Temporary line-strip overlay shown while the user is dragging a text selection.
+    Gives a standard PDF-reader feel (continuous highlight block instead of per-word boxes).
+    """
+
+    def __init__(self, x: float, y: float, width: float, height: float, line_rects: list = None, parent=None):
+        super().__init__(parent)
+        self.line_rects = line_rects or []
+        self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        fill = QColor(100, 181, 246)
+        fill.setAlpha(55)
+        for rect in self.line_rects:
+            painter.fillRect(rect, fill)
         painter.end()
 
 
@@ -430,16 +442,25 @@ class PageView(QWidget):
         self.highlight_widgets: list[HighlightWidget] = []
         self._selected_highlight: HighlightWidget | None = None
         self.search_highlight_widgets: list[SearchHighlightWidget] = []
+        self.selection_strip_widgets: list[SelectionStripWidget] = []
 
         self.image_label = QLabel(self)
         self.image_label.setScaledContents(False)
         self.image_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        # Layer that sits above the rendered page image but below the text overlay.
+        # Used for non-interactive search highlights so text remains fully readable.
+        self.highlight_layer = QWidget(self)
+        self.highlight_layer.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.highlight_layer.setStyleSheet("background: transparent;")
 
         self.overlay = QWidget(self)
         self.overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.overlay.setStyleSheet("background: transparent;")
         # Click on empty area clears selection; double-click on empty area captures whole page
         self.overlay.mousePressEvent = self._on_overlay_press
+        self.overlay.mouseMoveEvent = self._on_overlay_move
+        self.overlay.mouseReleaseEvent = self._on_overlay_release
         self.overlay.mouseDoubleClickEvent = self._on_overlay_double_click
 
         # Floating preview label that shows currently selected text
@@ -480,6 +501,17 @@ class PageView(QWidget):
             self.clear_selection()
         self._clear_highlight_selection()
 
+    def _on_overlay_move(self, event):
+        if not self.selection_active:
+            return
+        target = self.widget_at_global(event.globalPosition().toPoint())
+        if target and isinstance(target, WordWidget):
+            self.add_to_selection(target)
+
+    def _on_overlay_release(self, event):
+        if self.selection_active:
+            self.finish_selection(event.globalPosition().toPoint())
+
 
     def _on_overlay_double_click(self, event):
         # Only trigger if not clicking on a word widget, image hit widget, or link widget
@@ -503,6 +535,7 @@ class PageView(QWidget):
         pixmap = QPixmap.fromImage(image)
         self.image_label.setPixmap(pixmap)
         self.image_label.resize(pixmap.width(), pixmap.height())
+        self.highlight_layer.setGeometry(0, 0, pixmap.width(), pixmap.height())
         self.overlay.setGeometry(0, 0, pixmap.width(), pixmap.height())
         self.overlay.raise_()
         self.setFixedSize(pixmap.width(), pixmap.height())
@@ -523,7 +556,8 @@ class PageView(QWidget):
         self._update_highlight_widgets()
         if render_image:
             self._render_image()
-        self.overlay.raise_()
+        else:
+            self.overlay.raise_()
 
     def _update_geometry(self):
         """Update sizes based on page rect without rendering."""
@@ -531,6 +565,7 @@ class PageView(QWidget):
         w = int(page.rect.width * self.zoom)
         h = int(page.rect.height * self.zoom)
         self.image_label.resize(w, h)
+        self.highlight_layer.setGeometry(0, 0, w, h)
         self.overlay.setGeometry(0, 0, w, h)
         self.setFixedSize(w, h)
 
@@ -644,15 +679,38 @@ class PageView(QWidget):
         widget.set_selected(True)
         self.selected_widgets.add(widget)
         self._update_selection_preview()
+        self._update_selection_strips()
+        self.overlay.grabMouse()
 
     def add_to_selection(self, widget: WordWidget):
         if widget not in self.selected_widgets:
             widget.set_selected(True)
             self.selected_widgets.add(widget)
             self._update_selection_preview()
+            self._update_selection_strips()
+
+    def _update_selection_strips(self):
+        """Render the current text selection as continuous line strips."""
+        for w in self.selection_strip_widgets:
+            w.setParent(None)
+            w.deleteLater()
+        self.selection_strip_widgets.clear()
+
+        if not self.selected_widgets:
+            return
+
+        sorted_widgets = sorted(self.selected_widgets, key=lambda w: (w.y(), w.x()))
+        x0, y0, x1, y1, line_rects = self._build_line_strips(sorted_widgets)
+        sw = SelectionStripWidget(x0, y0, x1 - x0, y1 - y0, line_rects=line_rects, parent=self.overlay)
+        sw.show()
+        self.selection_strip_widgets.append(sw)
 
     def finish_selection(self, global_pos):
         self.selection_active = False
+        try:
+            self.overlay.releaseMouse()
+        except Exception:
+            pass
         if not self.selected_widgets:
             return
 
@@ -788,6 +846,14 @@ class PageView(QWidget):
         self.selected_widgets.clear()
         self.selection_preview.hide()
         self.clear_image_selections()
+        for w in self.selection_strip_widgets:
+            w.setParent(None)
+            w.deleteLater()
+        self.selection_strip_widgets.clear()
+        try:
+            self.overlay.releaseMouse()
+        except Exception:
+            pass
 
     def _update_selection_preview(self):
         if not self.selected_widgets:
@@ -1033,7 +1099,7 @@ class PageView(QWidget):
         x0, y0, x1, y1, line_rects = self._build_line_strips(matched_widgets)
         w = SearchHighlightWidget(
             x0, y0, x1 - x0, y1 - y0,
-            active=active, line_rects=line_rects, parent=self.overlay
+            active=active, line_rects=line_rects, parent=self.highlight_layer
         )
         w.show()
         self.search_highlight_widgets.append(w)

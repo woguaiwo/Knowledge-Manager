@@ -96,7 +96,7 @@ class PdfEngine:
             return ""
         return "".join(span["text"] for span in lines[line_no]["spans"])
 
-    def extract_full_text(self) -> str:
+    def extract_full_text(self, truncate: bool = True) -> str:
         """Extract full text from all pages. Truncated if extremely long."""
         if not self.doc:
             return ""
@@ -107,7 +107,7 @@ class PdfEngine:
             if text:
                 parts.append(f"--- Page {i + 1} ---\n{text}")
         full = "\n\n".join(parts)
-        if len(full) > 12000:
+        if truncate and len(full) > 12000:
             full = full[:12000] + "\n...[document truncated]"
         return full
 

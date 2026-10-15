@@ -7,20 +7,10 @@ import json
 import re
 from typing import List, Dict
 
-from core import api_client
+from core import api_client, prompt_manager
 
 
-_PROMPT_TEMPLATE = (
-    "你是一个阅读助手。用户针对一篇 PDF 文档提出问题，请在文档中找出最相关的段落，"
-    "并以 JSON 数组的形式返回。\n\n"
-    "每个条目必须包含:\n"
-    '- "page": 页码（从 1 开始）\n'
-    '- "quote": 文档中的原文片段（1-3 句话）\n'
-    '- "explanation": 简要说明该段落为何与问题相关\n\n'
-    "用户问题: {question}\n\n"
-    "文档内容:\n{pdf_text}\n\n"
-    "请只返回 JSON 数组，不要添加 markdown 代码块或其他额外文字。"
-)
+_PROMPT_KEY = "prompt_target_reading"
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -62,22 +52,19 @@ def _parse_json_array(text: str) -> List[Dict]:
     return []
 
 
-def analyze_document(pdf_text: str, question: str, provider: Dict) -> List[Dict]:
-    """
-    Ask the AI to find relevant passages for the given question.
-
-    Returns a list of dicts with keys:
-        page: int (1-based)
-        quote: str
-        explanation: str
-    """
-    prompt = _PROMPT_TEMPLATE.format(
+def _analyze_single_text(pdf_text: str, question: str, provider: Dict) -> List[Dict]:
+    """Send one chunk of text to the AI and parse the results."""
+    cfg = prompt_manager.get_prompt(_PROMPT_KEY)
+    user_template = cfg.get("user")
+    if not user_template:
+        user_template = prompt_manager.DEFAULT_PROMPTS[_PROMPT_KEY]["user"]
+    prompt = user_template.format(
         question=question.strip(),
         pdf_text=pdf_text.strip(),
     )
 
     messages = [
-        {"role": "system", "content": "You are a helpful reading assistant."},
+        {"role": "system", "content": cfg.get("system", "")},
         {"role": "user", "content": prompt},
     ]
 
@@ -90,6 +77,7 @@ def analyze_document(pdf_text: str, question: str, provider: Dict) -> List[Dict]
     )
 
     if response.startswith("Error:"):
+        # Surface token-limit / context errors clearly
         raise RuntimeError(response)
 
     raw_results = _parse_json_array(response)
@@ -112,3 +100,77 @@ def analyze_document(pdf_text: str, question: str, provider: Dict) -> List[Dict]
             "explanation": str(explanation).strip(),
         })
     return results
+
+
+def _deduplicate_results(results: List[Dict]) -> List[Dict]:
+    """Remove duplicate results based on page + quote snippet."""
+    seen = set()
+    unique = []
+    for item in results:
+        page = item.get("page")
+        quote = str(item.get("quote", "")).strip()
+        key = (page, quote[:120])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _split_text_into_chunks(pdf_text: str, max_chunk_size: int = 8000) -> List[str]:
+    """Split the document text into page-based chunks."""
+    import re
+    # Split by page markers like "--- Page 5 ---"
+    pages = re.split(r'\n*--- Page (\d+) ---\n*', pdf_text)
+    chunks = []
+    current_chunk = ""
+    current_size = 0
+
+    for i in range(1, len(pages), 2):
+        page_num = pages[i]
+        page_text = pages[i + 1] if i + 1 < len(pages) else ""
+        page_block = f"--- Page {page_num} ---\n{page_text}"
+        if current_size + len(page_block) > max_chunk_size and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = page_block
+            current_size = len(page_block)
+        else:
+            current_chunk += "\n\n" + page_block if current_chunk else page_block
+            current_size += len(page_block) + 2 if current_chunk else len(page_block)
+
+    if current_chunk:
+        chunks.append(current_chunk)
+    return chunks
+
+
+def analyze_document(pdf_text: str, question: str, provider: Dict) -> List[Dict]:
+    """
+    Ask the AI to find relevant passages for the given question.
+    For long documents the text is split into page-based chunks and analyzed
+    chunk by chunk; results are merged.
+
+    Returns a list of dicts with keys:
+        page: int (1-based)
+        quote: str
+        explanation: str
+    """
+    if not pdf_text.strip():
+        return []
+
+    # Short document: analyze in one shot
+    if len(pdf_text) <= 12000:
+        return _analyze_single_text(pdf_text, question, provider)
+
+    # Long document: page-based chunking
+    chunks = _split_text_into_chunks(pdf_text, max_chunk_size=8000)
+    all_results = []
+    for chunk in chunks:
+        try:
+            chunk_results = _analyze_single_text(chunk, question, provider)
+            all_results.extend(chunk_results)
+        except RuntimeError as e:
+            # If one chunk fails, continue with the others
+            if "context length" in str(e).lower() or "maximum context" in str(e).lower():
+                continue
+            raise
+    return _deduplicate_results(all_results)

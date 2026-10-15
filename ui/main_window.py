@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.pdf_engine import PdfEngine
-from core import database, api_client
+from core import database, api_client, prompt_manager
 from core.utils import clean_vocab_text, encode_qimage_to_base64
 from core.logger import get_logger
 logger = get_logger()
@@ -89,6 +89,35 @@ class ExplainQueryWorker(QThread):
         self.timer_data = timer_data or {}
         self._first_chunk_emitted = False
         self.cancelled = False
+        self._in_think_block = False
+
+    def _filter_chunk(self, chunk: str) -> str:
+        """Remove <think>...</think> blocks from a streaming chunk."""
+        result = []
+        i = 0
+        while i < len(chunk):
+            if self._in_think_block:
+                end = chunk.find('</think>', i)
+                if end == -1:
+                    # Still inside a think block; skip the rest of this chunk
+                    return ''.join(result)
+                i = end + len('</think>')
+                self._in_think_block = False
+            else:
+                start = chunk.find('<think>', i)
+                if start == -1:
+                    result.append(chunk[i:])
+                    break
+                result.append(chunk[i:start])
+                i = start + len('<think>')
+                self._in_think_block = True
+        return ''.join(result)
+
+    @staticmethod
+    def _strip_think_blocks(text: str) -> str:
+        """Remove all <think>...</think> blocks from a complete text."""
+        import re
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     def run(self):
         import time
@@ -111,8 +140,10 @@ class ExplainQueryWorker(QThread):
                     if chunk.startswith("Error:"):
                         self.result_ready.emit(chunk)
                         return
-                    full_text += chunk
-                    self.chunk_ready.emit(chunk)
+                    filtered = self._filter_chunk(chunk)
+                    if filtered:
+                        full_text += filtered
+                        self.chunk_ready.emit(filtered)
                 self.timer_data["result_ready"] = time.perf_counter()
                 self.result_ready.emit(full_text)
             else:
@@ -130,8 +161,9 @@ class ExplainQueryWorker(QThread):
                 if result.startswith("Error:"):
                     self.result_ready.emit(result)
                     return
-                self.chunk_ready.emit(result)
-                self.result_ready.emit(result)
+                cleaned = self._strip_think_blocks(result)
+                self.chunk_ready.emit(cleaned)
+                self.result_ready.emit(cleaned)
         except Exception as e:
             self.result_ready.emit(f"Error: {str(e)}")
 
@@ -618,7 +650,7 @@ class MainWindow(QMainWindow):
                 return
             tab.explain_ready = True
             tab.explain_messages = [
-                {"role": "system", "content": "You are a helpful reading assistant. The user is reading a document and will ask you to explain words or phrases. Reply in Chinese with detailed explanations including definition and usage."}
+                {"role": "system", "content": prompt_manager.get_prompt("prompt_explain_selection").get("system", "")}
             ]
             self.status_label.setText("Explain Mode: ON")
         else:
@@ -733,7 +765,7 @@ class MainWindow(QMainWindow):
 
         self._clear_target_reading_state()
         self.target_reading_panel.set_analyzing(True)
-        pdf_text = tab.engine.extract_full_text()
+        pdf_text = tab.engine.extract_full_text(truncate=False)
 
         self._target_worker = TargetReadingWorker(pdf_text, question, provider)
         self._target_worker.result_ready.connect(self._on_target_analysis_complete)
@@ -873,14 +905,16 @@ class MainWindow(QMainWindow):
         popup.show_near_cursor()
 
         # Reset conversation for each new word/phrase, keeping only system prompt
+        cfg = prompt_manager.get_prompt("prompt_explain_selection")
         tab.explain_messages = [
-            {"role": "system", "content": "You are a helpful reading assistant. The user is reading a document and will ask you to explain words or phrases. Reply in Chinese with detailed explanations including definition and usage."}
+            {"role": "system", "content": cfg.get("system", "")}
         ]
 
-        user_msg = f'请解释这个词/短语："{selected_text}"'
-        if context:
-            user_msg += f'\n上下文：{context}'
-        user_msg += '\n请用中文详细解释，包括定义和用法。'
+        user_template = cfg.get("user")
+        if not user_template:
+            user_template = prompt_manager.DEFAULT_PROMPTS["prompt_explain_selection"]["user"]
+        context_part = f'\n上下文：{context}' if context else ''
+        user_msg = user_template.format(selected_text=selected_text, context=context_part)
         tab.explain_messages.append({"role": "user", "content": user_msg})
         popup.append_text(f'**[Query]** {selected_text}')
 
@@ -1013,13 +1047,15 @@ class MainWindow(QMainWindow):
             mime = "image/bmp"
         timer["encode_done"] = time.perf_counter()
 
+        cfg = prompt_manager.get_prompt("prompt_explain_image")
         self._run_explain_with_image(
             tab,
-            text_prompt="请解释这张图片的内容和含义",
+            text_prompt=cfg.get("user", "请解释这张图片的内容和含义"),
             image_b64=b64,
             image_mime=mime,
             display_title="[Image]",
-            timer_data=timer
+            timer_data=timer,
+            prompt_key="prompt_explain_image"
         )
 
     def _on_page_double_clicked(self, page_number: int):
@@ -1053,13 +1089,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Failed to encode page image.")
             return
 
+        cfg = prompt_manager.get_prompt("prompt_explain_page")
         self._run_explain_with_image(
             tab,
-            text_prompt="请解释这个页面的内容",
+            text_prompt=cfg.get("user", "请解释这个页面的内容"),
             image_b64=b64,
             image_mime=mime,
             display_title="[Page]",
-            timer_data=timer
+            timer_data=timer,
+            prompt_key="prompt_explain_page"
         )
 
     def _on_link_clicked(self, link_data: dict):
@@ -1086,7 +1124,7 @@ class MainWindow(QMainWindow):
             tab.set_highlight_mode(checked)
             self.status_label.setText("Highlight Mode: ON" if checked else "Highlight Mode: OFF")
 
-    def _run_explain_with_image(self, tab, text_prompt: str, image_b64: str, image_mime: str, display_title: str, timer_data: dict | None = None):
+    def _run_explain_with_image(self, tab, text_prompt: str, image_b64: str, image_mime: str, display_title: str, timer_data: dict | None = None, prompt_key: str = "prompt_explain_image"):
         """Common logic for image-based explain queries."""
         import time
         timer = timer_data or {}
@@ -1109,7 +1147,7 @@ class MainWindow(QMainWindow):
         popup.show_near_cursor()
 
         tab.explain_messages = [
-            {"role": "system", "content": "You are a helpful reading assistant. The user is reading a document and may ask you to explain images or pages. Reply in Chinese with detailed explanations."}
+            {"role": "system", "content": prompt_manager.get_prompt(prompt_key).get("system", "")}
         ]
 
         multimodal_content = [
