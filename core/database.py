@@ -276,6 +276,17 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pdf_path TEXT NOT NULL,
+                page_number INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                parent_id INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 
@@ -983,6 +994,115 @@ def delete_highlight(highlight_id: int) -> bool:
         cursor = conn.execute("DELETE FROM highlights WHERE id = ?", (highlight_id,))
         conn.commit()
         return cursor.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Bookmarks
+# ---------------------------------------------------------------------------
+
+def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0) -> int:
+    """Add a bookmark and return its id."""
+    with _get_conn() as conn:
+        # Get max sort_order for this parent to append at end
+        cursor = conn.execute(
+            "SELECT MAX(sort_order) as max_order FROM bookmarks WHERE pdf_path = ? AND parent_id = ?",
+            (pdf_path, parent_id)
+        )
+        row = cursor.fetchone()
+        max_order = row["max_order"] if row["max_order"] is not None else -1
+        new_order = max_order + 1
+
+        cursor = conn.execute(
+            "INSERT INTO bookmarks (pdf_path, page_number, title, parent_id, sort_order, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (pdf_path, page_number, title, parent_id, new_order, datetime.now().isoformat())
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_bookmarks(pdf_path: str) -> List[Dict]:
+    """Get all bookmarks for a PDF, ordered by parent_id and sort_order."""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, pdf_path, page_number, title, parent_id, sort_order, created_at "
+            "FROM bookmarks WHERE pdf_path = ? ORDER BY parent_id, sort_order",
+            (pdf_path,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_bookmark(bookmark_id: int, title: str = None, parent_id: int = None, sort_order: int = None):
+    """Update bookmark fields."""
+    with _get_conn() as conn:
+        updates = []
+        params = []
+        if title is not None:
+            updates.append("title = ?")
+            params.append(title)
+        if parent_id is not None:
+            updates.append("parent_id = ?")
+            params.append(parent_id)
+        if sort_order is not None:
+            updates.append("sort_order = ?")
+            params.append(sort_order)
+        if not updates:
+            return
+        params.append(bookmark_id)
+        conn.execute(f"UPDATE bookmarks SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+
+
+def delete_bookmark(bookmark_id: int):
+    """Delete a bookmark and all its children."""
+    with _get_conn() as conn:
+        # Recursively delete children first
+        def _delete_children(parent_id: int):
+            rows = conn.execute("SELECT id FROM bookmarks WHERE parent_id = ?", (parent_id,)).fetchall()
+            for row in rows:
+                _delete_children(row["id"])
+            conn.execute("DELETE FROM bookmarks WHERE parent_id = ?", (parent_id,))
+
+        _delete_children(bookmark_id)
+        conn.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
+        conn.commit()
+
+
+def move_bookmark(bookmark_id: int, new_parent_id: int, new_sort_order: int):
+    """Move a bookmark to a new parent and position."""
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE bookmarks SET parent_id = ?, sort_order = ? WHERE id = ?",
+            (new_parent_id, new_sort_order, bookmark_id)
+        )
+        conn.commit()
+
+
+def reorder_bookmarks(bookmark_id: int, direction: int):
+    """Move a bookmark up (-1) or down (1) within its siblings."""
+    with _get_conn() as conn:
+        # Get current bookmark info
+        row = conn.execute(
+            "SELECT pdf_path, parent_id, sort_order FROM bookmarks WHERE id = ?",
+            (bookmark_id,)
+        ).fetchone()
+        if not row:
+            return
+        pdf_path, parent_id, current_order = row["pdf_path"], row["parent_id"], row["sort_order"]
+
+        # Find the bookmark to swap with
+        target_order = current_order + direction
+        row2 = conn.execute(
+            "SELECT id, sort_order FROM bookmarks WHERE pdf_path = ? AND parent_id = ? AND sort_order = ?",
+            (pdf_path, parent_id, target_order)
+        ).fetchone()
+        if not row2:
+            return
+
+        # Swap sort_order
+        conn.execute("UPDATE bookmarks SET sort_order = ? WHERE id = ?", (target_order, bookmark_id))
+        conn.execute("UPDATE bookmarks SET sort_order = ? WHERE id = ?", (current_order, row2["id"]))
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------

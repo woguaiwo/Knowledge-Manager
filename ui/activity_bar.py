@@ -31,6 +31,7 @@ class ActivityBar(QWidget):
     Left-side narrow bar with icon buttons for Explorer, Mask Mode, Vocab Mode, Explain Mode.
     """
     explorer_clicked = Signal()
+    bookmark_toggled = Signal(bool)
     mask_toggled = Signal(bool)
     vocab_toggled = Signal(bool)
     explain_toggled = Signal(bool)
@@ -61,6 +62,17 @@ class ActivityBar(QWidget):
         self.btn_explorer.setStyleSheet(self._btn_style())
         self.btn_explorer.clicked.connect(lambda checked=False: self.explorer_clicked.emit())
         layout.addWidget(self.btn_explorer)
+
+        # Bookmark button
+        self.btn_bookmark = QPushButton(self)
+        self.btn_bookmark.setIcon(_create_icon("🔖", QColor(180, 100, 50)))
+        self.btn_bookmark.setIconSize(QSize(32, 32))
+        self.btn_bookmark.setToolTip("Bookmarks")
+        self.btn_bookmark.setCheckable(True)
+        self.btn_bookmark.setFixedSize(44, 44)
+        self.btn_bookmark.setStyleSheet(self._btn_style())
+        self.btn_bookmark.clicked.connect(lambda checked: self.bookmark_toggled.emit(checked))
+        layout.addWidget(self.btn_bookmark)
 
         # Mask Mode button
         self.btn_mask = QPushButton(self)
@@ -174,6 +186,11 @@ class ActivityBar(QWidget):
         self.btn_explorer.blockSignals(True)
         self.btn_explorer.setChecked(checked)
         self.btn_explorer.blockSignals(False)
+
+    def set_bookmark_checked(self, checked: bool):
+        self.btn_bookmark.blockSignals(True)
+        self.btn_bookmark.setChecked(checked)
+        self.btn_bookmark.blockSignals(False)
 
     def set_explain_checked(self, checked: bool):
         self.btn_explain.blockSignals(True)

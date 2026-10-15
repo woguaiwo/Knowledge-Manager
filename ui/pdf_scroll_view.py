@@ -2,7 +2,7 @@
 Scrollable view that hosts multiple PageView widgets for a PDF document.
 """
 from PySide6.QtCore import Qt, Signal, QEvent, QTimer
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QSizePolicy, QLabel
 
 from core.pdf_engine import PdfEngine
 from ui.widgets import PageView
@@ -29,6 +29,15 @@ class PdfScrollView(QWidget):
         self._zoom_timer.setSingleShot(True)
         self._zoom_timer.timeout.connect(self._commit_zoom)
 
+        # Page indicator bar
+        self.page_indicator = QLabel("Page 1 / 1")
+        self.page_indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.page_indicator.setStyleSheet(
+            "QLabel { background: rgba(60, 60, 60, 200); color: #ffffff; "
+            "padding: 4px 12px; font-size: 12px; border-bottom: 1px solid #444; }"
+        )
+        self.page_indicator.setFixedHeight(28)
+
         self.scroll_area = QScrollArea(self)
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -46,10 +55,12 @@ class PdfScrollView(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.page_indicator)
         layout.addWidget(self.scroll_area)
         self.setLayout(layout)
 
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll)
+        self.page_changed.connect(self._update_page_indicator)
 
     def load_document(self, engine: PdfEngine, zoom: float = 1.5):
         self.clear()
@@ -126,6 +137,12 @@ class PdfScrollView(QWidget):
         if primary >= 0 and getattr(self, '_last_primary_page', -1) != primary:
             self._last_primary_page = primary
             self.page_changed.emit(primary)
+
+    def _update_page_indicator(self, page_index: int):
+        """Update the page indicator label."""
+        if self.engine:
+            total = self.engine.page_count
+            self.page_indicator.setText(f"Page {page_index + 1} / {total}")
 
     def set_mask_mode(self, active: bool, ratio: float = 0.35):
         for pv in self.page_views:

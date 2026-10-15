@@ -32,6 +32,7 @@ from ui.target_reading_panel import TargetReadingPanel
 from ui.target_reading_popup import TargetReadingPopup
 from ui.quiz_sidebar import QuizSidebar
 from ui.quiz_tab_widget import QuizTabWidget
+from ui.bookmark_panel import BookmarkPanel
 
 
 class TargetReadingWorker(QThread):
@@ -206,6 +207,7 @@ class MainWindow(QMainWindow):
         # Left Activity Bar
         self.activity_bar = ActivityBar(central)
         self.activity_bar.explorer_clicked.connect(self._toggle_explorer)
+        self.activity_bar.bookmark_toggled.connect(self._toggle_bookmark_panel)
         self.activity_bar.mask_toggled.connect(self._toggle_mask_mode)
         self.activity_bar.vocab_toggled.connect(self._toggle_vocab_mode)
         self.activity_bar.explain_toggled.connect(self._toggle_explain_mode)
@@ -234,6 +236,12 @@ class MainWindow(QMainWindow):
         self.sidebar.open_folder_requested.connect(self._open_folder)
         self.sidebar.hide()
         left_layout.addWidget(self.sidebar)
+
+        # Bookmark panel (shares space with sidebar)
+        self.bookmark_panel = BookmarkPanel(left_panel)
+        self.bookmark_panel.bookmark_clicked.connect(self._on_bookmark_clicked)
+        self.bookmark_panel.hide()
+        left_layout.addWidget(self.bookmark_panel)
 
         # Vertical divider between sidebar and quiz/ai area (theme-adaptive)
         self._left_divider = QFrame(left_panel)
@@ -425,12 +433,13 @@ class MainWindow(QMainWindow):
         text_color = colors['text']  # white on dark, black on light
         left_panel_visible = (
             self.sidebar.isVisible()
+            or self.bookmark_panel.isVisible()
             or self.quiz_sidebar.isVisible()
             or self.ai_chat_panel.isVisible()
             or self.target_reading_panel.isVisible()
         )
         # Sidebar divider: visible when sidebar is shown alongside another left panel
-        show_sidebar_div = self.sidebar.isVisible() and left_panel_visible
+        show_sidebar_div = (self.sidebar.isVisible() or self.bookmark_panel.isVisible()) and left_panel_visible
         self._left_divider.setVisible(show_sidebar_div)
         self._left_divider.setStyleSheet(f"background: {text_color}; color: {text_color};")
 
@@ -445,6 +454,7 @@ class MainWindow(QMainWindow):
         """Collapse left panel when nothing is visible on the left."""
         left_visible = (
             self.sidebar.isVisible()
+            or self.bookmark_panel.isVisible()
             or self.ai_chat_panel.isVisible()
             or self.quiz_sidebar.isVisible()
             or self.target_reading_panel.isVisible()
@@ -468,6 +478,26 @@ class MainWindow(QMainWindow):
             self.activity_bar.set_ai_checked(False)
         self._update_left_dividers()
         self._update_splitter_sizes()
+
+    def _toggle_bookmark_panel(self, checked: bool):
+        """Toggle bookmark panel visibility."""
+        self.bookmark_panel.setVisible(checked)
+        if checked:
+            # Mutually exclusive with sidebar
+            self.sidebar.hide()
+            self.activity_bar.set_explorer_checked(False)
+            # Update bookmark panel with current PDF
+            tab = self._current_tab()
+            if tab and tab.pdf_path:
+                self.bookmark_panel.set_pdf(tab.pdf_path)
+        self._update_left_dividers()
+        self._update_splitter_sizes()
+
+    def _on_bookmark_clicked(self, page_number: int):
+        """Jump to the bookmarked page."""
+        tab = self._current_tab()
+        if tab and tab.scroll_view:
+            tab.scroll_view.scroll_to_page(page_number)
 
     def _show_vocab_panel(self):
         self.vocab_dock.show()
@@ -511,6 +541,7 @@ class MainWindow(QMainWindow):
         tab.scroll_view.page_double_clicked.connect(self._on_page_double_clicked)
         tab.scroll_view.link_clicked.connect(self._on_link_clicked)
         tab.scroll_view.page_changed.connect(self.note_panel.on_page_changed)
+        tab.scroll_view.page_changed.connect(self._on_page_changed_for_bookmark)
 
         # Auto-load saved vocabulary if a mapped file exists
         loaded_from_file = database.load_vocab_from_file(path)
@@ -527,6 +558,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.setCurrentIndex(idx)
         self.vocab_panel.set_pdf(path)
         self.note_panel.set_pdf(path, tab.engine.page_count if tab.engine else 0)
+        self.bookmark_panel.set_pdf(path)
         if not loaded_from_file:
             self.status_label.setText(f"Opened: {name}")
 
@@ -534,12 +566,15 @@ class MainWindow(QMainWindow):
         if index < 0:
             self.vocab_panel.set_pdf("")
             self.note_panel.set_pdf("")
+            self.bookmark_panel.set_pdf("")
             self.activity_bar.set_mask_checked(False)
             self.activity_bar.set_vocab_checked(False)
             self.activity_bar.set_explain_checked(False)
             self.activity_bar.set_note_checked(False)
             self.activity_bar.set_explorer_checked(False)
+            self.activity_bar.set_bookmark_checked(False)
             self.sidebar.hide()
+            self.bookmark_panel.hide()
             self._update_splitter_sizes()
             self.lbl_zoom.setText(f"{int(self.zoom * 100)}%")
             if self._explain_popup:
@@ -553,8 +588,10 @@ class MainWindow(QMainWindow):
         if not isinstance(tab, PdfTabWidget):
             return
         self.vocab_panel.set_pdf(tab.pdf_path)
+        self.bookmark_panel.set_pdf(tab.pdf_path)
         current_page = getattr(tab.scroll_view, '_last_primary_page', 0) if tab.scroll_view else 0
         self.note_panel.set_pdf(tab.pdf_path, tab.engine.page_count if tab.engine else 0, current_page)
+        self.bookmark_panel.set_current_page(current_page)
         self.activity_bar.set_mask_checked(tab.mask_mode)
         self.activity_bar.set_vocab_checked(tab.vocab_mode)
         self.activity_bar.set_explain_checked(tab.explain_mode)
@@ -570,6 +607,10 @@ class MainWindow(QMainWindow):
         if self._explain_popup:
             self._explain_popup.hide()
             self._explain_popup = None
+
+    def _on_page_changed_for_bookmark(self, page_number: int):
+        """Update bookmark panel's current page when scrolling."""
+        self.bookmark_panel.set_current_page(page_number)
 
     def _on_tab_close(self, index: int):
         tab = self.tab_widget.widget(index)
