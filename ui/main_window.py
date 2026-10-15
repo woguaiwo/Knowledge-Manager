@@ -556,6 +556,7 @@ class MainWindow(QMainWindow):
             pv.annotation_edit_requested.connect(self._on_annotation_edit_requested)
             pv.annotation_hover_entered.connect(self._on_annotation_hover_show)
             pv.annotation_hover_left.connect(self._on_annotation_hover_hide)
+            pv.annotation_placed.connect(self._on_annotation_placed)
             # Also connect highlight annotation signals
             for hw in pv.highlight_widgets:
                 hw.annotation_edit_requested.connect(self._on_highlight_annotation_edit)
@@ -1213,26 +1214,34 @@ class MainWindow(QMainWindow):
         tab = self._current_tab()
         if tab and tab.scroll_view:
             tab.scroll_view.set_annotation_mode(checked)
-            self.status_label.setText(
-                "Annotation Mode: Click on page to place icon" if checked
-                else "Annotation Mode: OFF"
-            )
+            if checked:
+                self.status_label.setText("Click on page to place annotation")
+            else:
+                self.status_label.setText("")
+
+    def _on_annotation_placed(self, annot_id: int, global_pos):
+        """Handle new annotation placed: exit mode and open editor."""
+        # Exit annotation mode (one-shot)
+        self.act_annotation.setChecked(False)
+        tab = self._current_tab()
+        if tab and tab.scroll_view:
+            tab.scroll_view.set_annotation_mode(False)
+        # Auto-open edit dialog
+        self._show_annotation_edit(annot_id, global_pos, "")
 
     def _show_annotation_edit(self, annotation_id: int, global_pos, note_text: str = ""):
-        """Show the editable annotation popup."""
-        if self._annotation_edit_popup:
-            self._annotation_edit_popup.hide()
-            self._annotation_edit_popup = None
-        self._annotation_edit_popup = AnnotationEditPopup(annotation_id, note_text, self)
-        self._annotation_edit_popup.save_requested.connect(self._on_annotation_save)
-        self._annotation_edit_popup.delete_requested.connect(self._on_annotation_delete)
-        self._annotation_edit_popup.closed.connect(self._on_annotation_popup_closed)
-        self._annotation_edit_popup.show_at(global_pos)
+        """Show the editable annotation dialog and handle result."""
+        text, is_delete = AnnotationEditPopup.edit_at(
+            annotation_id, global_pos, note_text, self
+        )
+        if is_delete:
+            self._do_annotation_delete(annotation_id)
+        elif text is not None:
+            self._do_annotation_save(annotation_id, text)
 
-    def _on_annotation_save(self, annotation_id: int, text: str):
-        """Save annotation text to database."""
+    def _do_annotation_save(self, annotation_id: int, text: str):
+        """Save annotation text to database and update UI."""
         database.update_annotation_text(annotation_id, text)
-        # Update widget text
         tab = self._current_tab()
         if tab and tab.scroll_view:
             for pv in tab.scroll_view.page_views:
@@ -1240,16 +1249,14 @@ class MainWindow(QMainWindow):
                     if aw.annotation_id == annotation_id:
                         aw.note_text = text
                 for hw in pv.highlight_widgets:
-                    if hasattr(hw, 'set_annotation_text'):
-                        # Check if this highlight has this annotation
-                        annot = database.get_annotation_for_target(
-                            tab.pdf_path, "highlight", hw.highlight_id
-                        )
-                        if annot and annot["id"] == annotation_id:
-                            hw.set_annotation_text(text)
+                    annot = database.get_annotation_for_target(
+                        tab.pdf_path, "highlight", hw.highlight_id
+                    )
+                    if annot and annot["id"] == annotation_id:
+                        hw.set_annotation_text(text)
         self.status_label.setText("Annotation saved.")
 
-    def _on_annotation_delete(self, annotation_id: int):
+    def _do_annotation_delete(self, annotation_id: int):
         """Delete annotation from database and UI."""
         database.delete_annotation(annotation_id)
         tab = self._current_tab()
@@ -1258,25 +1265,16 @@ class MainWindow(QMainWindow):
                 pv.remove_annotation_widget(annotation_id)
         self.status_label.setText("Annotation deleted.")
 
-    def _on_annotation_popup_closed(self):
-        """Clean up reference when popup closes."""
-        self._annotation_edit_popup = None
-
     def _on_annotation_hover_show(self, annot_id: int, text: str, global_pos):
         """Show read-only annotation tooltip following cursor."""
-        if not self._annotation_view_popup:
-            self._annotation_view_popup = AnnotationViewPopup(self)
-        self._annotation_view_popup.set_text(text)
-        self._annotation_view_popup.show_at_cursor(global_pos)
+        AnnotationViewPopup.show(text, global_pos)
 
     def _on_annotation_hover_hide(self, annot_id: int):
         """Hide read-only annotation tooltip."""
-        if self._annotation_view_popup:
-            self._annotation_view_popup.hide_tooltip()
+        AnnotationViewPopup.hide()
 
     def _on_annotation_edit_requested(self, annot_id: int, global_pos):
         """Handle annotation edit request from icon or highlight."""
-        # Get existing text
         tab = self._current_tab()
         note_text = ""
         if tab and tab.pdf_path:
@@ -1292,12 +1290,10 @@ class MainWindow(QMainWindow):
         tab = self._current_tab()
         if not tab or not tab.pdf_path:
             return
-        # Check if highlight already has an annotation
         existing = database.get_annotation_for_target(tab.pdf_path, "highlight", highlight_id)
         if existing:
             self._show_annotation_edit(existing["id"], global_pos, existing["note_text"])
         else:
-            # Create new annotation for this highlight
             annot_id = database.add_annotation(
                 tab.pdf_path, 0, 0, 0, "", "highlight", highlight_id
             )

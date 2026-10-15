@@ -1,60 +1,60 @@
 """
-Annotation popups: edit (writable) and view (read-only) floating windows.
+Annotation popups: edit (QDialog) and view (QToolTip) implementations.
+Uses Qt's built-in systems for maximum reliability.
 """
 from PySide6.QtCore import Qt, Signal, QPoint
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel,
+    QDialog, QVBoxLayout, QHBoxLayout, QTextEdit, QLabel,
     QPushButton, QFrame
 )
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QCursor
+from PySide6.QtWidgets import QToolTip
 
 from core.theme_colors import get_theme_colors
 
 
-class AnnotationEditPopup(QFrame):
-    """Editable annotation popup for writing/editing notes."""
-
-    save_requested = Signal(int, str)  # annotation_id, text
-    delete_requested = Signal(int)     # annotation_id
-    closed = Signal()
+class AnnotationEditPopup(QDialog):
+    """Editable annotation dialog for writing/editing notes."""
 
     def __init__(self, annotation_id: int, initial_text: str = "", parent=None):
         super().__init__(parent)
         self.annotation_id = annotation_id
-        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.result_text = None
+        self.result_delete = False
 
-        self.setMinimumWidth(280)
-        self.setMaximumWidth(400)
+        self.setWindowTitle("📝 Annotation")
+        self.setMinimumWidth(320)
+        self.setMaximumWidth(450)
+        self.setModal(False)
 
-        container = QFrame(self)
         colors = get_theme_colors()
         bg = colors.get("bg", "#2b2b2b")
         text_c = colors.get("text", "#eeeeee")
         border = colors.get("border", "#555555")
+        input_bg = colors.get("input_bg", bg)
 
-        container.setStyleSheet(
-            f"QFrame {{ background: {bg}; border: 1px solid {border}; border-radius: 8px; }}"
-            f"QTextEdit {{ background: {colors.get('input_bg', bg)}; color: {text_c}; "
+        self.setStyleSheet(
+            f"QDialog {{ background: {bg}; }}"
+            f"QTextEdit {{ background: {input_bg}; color: {text_c}; "
             f"border: 1px solid {border}; border-radius: 4px; padding: 6px; }}"
             f"QPushButton {{ background: {colors.get('hover', '#444444')}; color: {text_c}; "
-            f"border: none; border-radius: 4px; padding: 6px 14px; }}"
+            f"border: none; border-radius: 4px; padding: 6px 14px; min-width: 70px; }}"
             f"QPushButton:hover {{ background: {colors.get('selected', '#3a5a8a')}; }}"
-            f"QLabel {{ color: {text_c}; }}"
+            f"QLabel {{ color: {text_c}; background: transparent; }}"
         )
 
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
         header = QLabel("📝 Annotation")
-        header.setStyleSheet("font-weight: bold; font-size: 13px; border: none;")
+        header.setStyleSheet("font-weight: bold; font-size: 14px;")
         layout.addWidget(header)
 
         self.text_edit = QTextEdit()
         self.text_edit.setPlainText(initial_text)
-        self.text_edit.setMinimumHeight(80)
-        self.text_edit.setMaximumHeight(200)
+        self.text_edit.setMinimumHeight(100)
+        self.text_edit.setMaximumHeight(220)
         layout.addWidget(self.text_edit)
 
         btn_row = QHBoxLayout()
@@ -69,93 +69,47 @@ class AnnotationEditPopup(QFrame):
         btn_row.addWidget(self.btn_delete)
 
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_cancel.clicked.connect(self._on_cancel)
+        self.btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(self.btn_cancel)
 
         layout.addLayout(btn_row)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(container)
-
-        self.adjustSize()
-
     def _on_save(self):
-        text = self.text_edit.toPlainText().strip()
-        self.save_requested.emit(self.annotation_id, text)
-        self.hide()
-        self.closed.emit()
+        self.result_text = self.text_edit.toPlainText().strip()
+        self.accept()
 
     def _on_delete(self):
-        self.delete_requested.emit(self.annotation_id)
-        self.hide()
-        self.closed.emit()
+        self.result_delete = True
+        self.accept()
 
-    def _on_cancel(self):
-        self.hide()
-        self.closed.emit()
+    @staticmethod
+    def edit_at(annotation_id: int, global_pos: QPoint, initial_text: str = "", parent=None) -> tuple:
+        """Show the edit dialog at position. Returns (text, is_delete) or (None, False) if cancelled."""
+        dlg = AnnotationEditPopup(annotation_id, initial_text, parent)
+        # Position near the click point
+        dlg.move(global_pos + QPoint(20, 20))
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Accepted:
+            return (dlg.result_text, dlg.result_delete)
+        return (None, False)
 
-    def show_at(self, global_pos: QPoint):
-        """Show popup at a fixed position near the target."""
-        self.move(global_pos)
-        self.show()
-        self.raise_()
-        self.text_edit.setFocus()
 
+class AnnotationViewPopup:
+    """
+    Read-only annotation tooltip using QToolTip.
+    Follows cursor position automatically.
+    """
 
-class AnnotationViewPopup(QFrame):
-    """Read-only annotation tooltip that follows the cursor."""
+    @staticmethod
+    def show(text: str, global_pos: QPoint = None):
+        """Show tooltip at cursor position (or given position)."""
+        if not global_pos:
+            global_pos = QCursor.pos()
+        display_text = text if text else "(No note)"
+        # QToolTip handles positioning and styling natively
+        QToolTip.showText(global_pos + QPoint(16, 16), display_text)
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        # Use Window flag instead of Popup for stability
-        # Popup auto-closes on clicks which is unreliable for hover tooltips
-        self.setWindowFlags(
-            Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.NoDropShadowWindowHint | Qt.WindowType.WindowStaysOnTopHint
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-
-        self.setMaximumWidth(320)
-
-        container = QFrame(self)
-        colors = get_theme_colors()
-        bg = colors.get("popup_bg", "#333333")
-        text_c = colors.get("text", "#eeeeee")
-        border = colors.get("border", "#555555")
-
-        container.setStyleSheet(
-            f"QFrame {{ background: {bg}; border: 1px solid {border}; border-radius: 6px; }}"
-        )
-
-        self.label = QLabel()
-        self.label.setWordWrap(True)
-        self.label.setStyleSheet(
-            f"color: {text_c}; padding: 8px 12px; font-size: 12px; border: none; background: transparent;"
-        )
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.label)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(container)
-
-    def set_text(self, text: str):
-        """Set the annotation text to display."""
-        display = text if text else "(No note)"
-        self.label.setText(display)
-        self.adjustSize()
-
-    def show_at_cursor(self, global_pos: QPoint):
-        """Show tooltip at cursor position with fixed offset (bottom-right)."""
-        offset = QPoint(16, 16)
-        self.move(global_pos + offset)
-        self.show()
-        self.raise_()
-
-    def hide_tooltip(self):
+    @staticmethod
+    def hide():
         """Hide the tooltip."""
-        self.hide()
+        QToolTip.hideText()

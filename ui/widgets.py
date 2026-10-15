@@ -596,6 +596,7 @@ class PageView(QWidget):
     annotation_edit_requested = Signal(int, object)      # annotation_id, global_pos
     annotation_hover_entered = Signal(int, str, object)  # annotation_id, text, global_pos
     annotation_hover_left = Signal(int)                   # annotation_id
+    annotation_placed = Signal(int, object)              # annotation_id, global_pos
 
     def __init__(self, engine: PdfEngine, page_number: int, zoom: float = 1.5, parent=None):
         super().__init__(parent)
@@ -678,6 +679,7 @@ class PageView(QWidget):
         if not self.engine or not self.engine.path:
             return
         from core import database
+        from PySide6.QtGui import QCursor
         # Convert to unzoomed PDF coordinates
         pdf_x = local_pos.x() / self.zoom
         pdf_y = local_pos.y() / self.zoom
@@ -689,8 +691,8 @@ class PageView(QWidget):
         # Exit annotation mode after placing
         self.annotation_mode = False
         self.unsetCursor()
-        if self._get_page_view() and hasattr(self._get_page_view(), 'annotation_mode_changed'):
-            pass  # Signal handled by main_window via cursor restore
+        # Notify main window to auto-open editor
+        self.annotation_placed.emit(annot_id, QCursor.pos())
 
     def _create_annotation_widget(self, annot_id: int, pdf_x: float, pdf_y: float, note_text: str):
         """Create an AnnotationIconWidget from PDF coordinates."""
