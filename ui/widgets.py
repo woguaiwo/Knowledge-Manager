@@ -238,14 +238,13 @@ class LinkWidget(QWidget):
 class InstantTooltip(QLabel):
     """Custom tooltip with zero delay - shows/hides instantly."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.setWindowFlags(
-            Qt.WindowType.Window |
+            Qt.WindowType.Tool |
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.NoDropShadowWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.WindowDoesNotAcceptFocus
+            Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -260,7 +259,6 @@ class InstantTooltip(QLabel):
             "font-size: 12px;"
             "}"
         )
-        self.hide()
 
     def show_at(self, text: str, global_pos):
         """Show tooltip instantly at given position."""
@@ -390,16 +388,16 @@ class AnnotationIconWidget(QWidget):
 
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
-        # Create tooltip instance if needed
-        if not hasattr(self, '_tooltip') or self._tooltip is None:
-            self._tooltip = InstantTooltip()
+        # Create tooltip with parent for proper window management
+        if self._tooltip is None:
+            self._tooltip = InstantTooltip(self.window())
         display = self.note_text if self.note_text else "(Double-click to add note)"
         self._tooltip.show_at(display, QCursor.pos())
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        if hasattr(self, '_tooltip') and self._tooltip is not None:
+        if self._tooltip is not None:
             self._tooltip.hide()
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
@@ -441,6 +439,7 @@ class HighlightWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._hovered = False
         self._selected = False
+        self._tooltip = None  # lazy-init in enterEvent
 
     def set_selected(self, selected: bool):
         self._selected = selected
@@ -511,8 +510,8 @@ class HighlightWidget(QWidget):
         self.update()
         if self.annotation_text:
             from PySide6.QtGui import QCursor
-            if not hasattr(self, '_tooltip') or self._tooltip is None:
-                self._tooltip = InstantTooltip()
+            if self._tooltip is None:
+                self._tooltip = InstantTooltip(self.window())
             self._tooltip.show_at(self.annotation_text, QCursor.pos())
             self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
         super().enterEvent(event)
@@ -520,7 +519,7 @@ class HighlightWidget(QWidget):
     def leaveEvent(self, event):
         self._hovered = False
         self.update()
-        if hasattr(self, '_tooltip') and self._tooltip is not None:
+        if self._tooltip is not None:
             self._tooltip.hide()
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
