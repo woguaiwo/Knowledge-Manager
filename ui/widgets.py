@@ -315,17 +315,24 @@ class AnnotationIconWidget(QWidget):
             if not self._dragging and (abs(delta.x()) > 5 or abs(delta.y()) > 5):
                 self._dragging = True
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                if self._hover_label is not None:
+                    self._hover_label.hide()
             if self._dragging:
-                # Move widget directly
-                new_x = self.x() + delta.x()
-                new_y = self.y() + delta.y()
-                self.move(new_x, new_y)
+                self.move(self.x() + delta.x(), self.y() + delta.y())
                 self._drag_start = current
                 event.accept()
+                return
+
+        # Keep the hover hint next to the icon while the cursor moves over it.
+        if self._hover_label is not None and self._hover_label.isVisible():
+            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
+            self._hover_label.move(local_pos + QPoint(28, 0))
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
-            if self._dragging:
+            was_dragging = self._dragging
+            if was_dragging:
                 # Save new position to database
                 pv = self._get_page_view()
                 if pv:
@@ -333,10 +340,11 @@ class AnnotationIconWidget(QWidget):
                     new_pdf_y = self.y() / pv.zoom
                     self.unzoomed_pos = (new_pdf_x, new_pdf_y)
                     self.moved.emit(self.annotation_id, new_pdf_x, new_pdf_y)
-                self._dragging = False
-                self.setCursor(Qt.CursorShape.PointingHandCursor)
-                event.accept()
+            self._dragging = False
             self._drag_start = None
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def _show_context_menu(self, global_pos):
@@ -394,14 +402,6 @@ class AnnotationIconWidget(QWidget):
             self._hover_label.hide()
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
-
-    def mouseMoveEvent(self, event):
-        # Update hover label position when cursor moves while hovering
-        if self._hover_label is not None and self._hover_label.isVisible():
-            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
-            self._hover_label.move(local_pos + QPoint(28, 0))
-        super().mouseMoveEvent(event)
-
 
 class HighlightWidget(QWidget):
     """
