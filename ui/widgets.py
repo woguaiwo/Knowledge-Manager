@@ -12,6 +12,24 @@ from core.pdf_engine import PdfEngine
 from core.logger import get_logger
 from core.theme_colors import get_theme_colors
 
+
+def _get_hover_label_style() -> str:
+    """Return theme-adaptive stylesheet for hover labels."""
+    colors = get_theme_colors()
+    bg = colors.get("popup_bg", "#333333")
+    text = colors.get("text", "#ffffff")
+    border = colors.get("border", "#555555")
+    return (
+        "QLabel {"
+        f"background: {bg};"
+        f"color: {text};"
+        f"border: 1px solid {border};"
+        "border-radius: 4px;"
+        "padding: 6px 10px;"
+        "font-size: 12px;"
+        "}"
+    )
+
 logger = get_logger()
 
 
@@ -356,16 +374,7 @@ class AnnotationIconWidget(QWidget):
         # Create hover label as child widget (no window system delay)
         if self._hover_label is None:
             self._hover_label = QLabel(self.parentWidget())
-            self._hover_label.setStyleSheet(
-                "QLabel {"
-                "background: rgba(60, 60, 60, 240);"
-                "color: #ffffff;"
-                "border: 1px solid #555555;"
-                "border-radius: 4px;"
-                "padding: 6px 10px;"
-                "font-size: 12px;"
-                "}"
-            )
+            self._hover_label.setStyleSheet(_get_hover_label_style())
             self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         display = self.note_text if self.note_text else "(Double-click to add note)"
         self._hover_label.setText(display)
@@ -385,10 +394,10 @@ class AnnotationIconWidget(QWidget):
         super().leaveEvent(event)
 
     def mouseMoveEvent(self, event):
-        # Update tooltip position when cursor moves while hovering
-        if hasattr(self, '_tooltip') and self._tooltip is not None and self._tooltip.isVisible():
-            from PySide6.QtGui import QCursor
-            self._tooltip.move(QCursor.pos() + QPoint(16, 16))
+        # Update hover label position when cursor moves while hovering
+        if self._hover_label is not None and self._hover_label.isVisible():
+            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
+            self._hover_label.move(local_pos + QPoint(28, 0))
         super().mouseMoveEvent(event)
 
 
@@ -495,16 +504,7 @@ class HighlightWidget(QWidget):
             # Create hover label as child widget (no window system delay)
             if self._hover_label is None:
                 self._hover_label = QLabel(self.parentWidget())
-                self._hover_label.setStyleSheet(
-                    "QLabel {"
-                    "background: rgba(60, 60, 60, 240);"
-                    "color: #ffffff;"
-                    "border: 1px solid #555555;"
-                    "border-radius: 4px;"
-                    "padding: 6px 10px;"
-                    "font-size: 12px;"
-                    "}"
-                )
+                self._hover_label.setStyleSheet(_get_hover_label_style())
                 self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             self._hover_label.setText(self.annotation_text)
             self._hover_label.adjustSize()
