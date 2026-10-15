@@ -238,11 +238,13 @@ class LinkWidget(QWidget):
 class AnnotationIconWidget(QWidget):
     """
     Small icon placed on PDF page for annotations.
-    Double-click to edit, hover to view.
+    Double-click to edit, hover to view, drag to move, right-click for menu.
     """
     edit_requested = Signal(int, object)       # annotation_id, global_pos
     hover_entered = Signal(int, str, object)   # annotation_id, text, global_pos
     hover_left = Signal(int)                    # annotation_id
+    delete_requested = Signal(int)              # annotation_id
+    moved = Signal(int, float, float)           # annotation_id, new_pdf_x, new_pdf_y
 
     def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", unzoomed_pos: tuple = None, parent=None):
         super().__init__(parent)
@@ -253,7 +255,9 @@ class AnnotationIconWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Double-click to edit annotation")
+        self.setToolTip("Double-click to edit, drag to move, right-click for menu")
+        self._drag_start = None
+        self._dragging = False
 
     def update_geometry(self, x: float, y: float, width: float, height: float):
         self.setGeometry(int(x), int(y), int(width), int(height))
@@ -274,13 +278,81 @@ class AnnotationIconWidget(QWidget):
         painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "✎")
         painter.end()
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.globalPosition().toPoint()
+            self._dragging = False
+            event.accept()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self._show_context_menu(event.globalPosition().toPoint())
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            current = event.globalPosition().toPoint()
+            delta = current - self._drag_start
+            if not self._dragging and (abs(delta.x()) > 5 or abs(delta.y()) > 5):
+                self._dragging = True
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            if self._dragging:
+                # Move widget directly
+                new_x = self.x() + delta.x()
+                new_y = self.y() + delta.y()
+                self.move(new_x, new_y)
+                self._drag_start = current
+                event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+            if self._dragging:
+                # Save new position to database
+                pv = self._get_page_view()
+                if pv:
+                    new_pdf_x = self.x() / pv.zoom
+                    new_pdf_y = self.y() / pv.zoom
+                    self.unzoomed_pos = (new_pdf_x, new_pdf_y)
+                    self.moved.emit(self.annotation_id, new_pdf_x, new_pdf_y)
+                self._dragging = False
+                self.setCursor(Qt.CursorShape.PointingHandCursor)
+                event.accept()
+            self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def _show_context_menu(self, global_pos):
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        colors = get_theme_colors()
+        bg = colors.get("bg", "#333333")
+        text = colors.get("text", "#eeeeee")
+        border = colors.get("border", "#555555")
+        hover = colors.get("hover", "#444444")
+        menu.setStyleSheet(
+            f"QMenu {{ background: {bg}; color: {text}; border: 1px solid {border}; }}"
+            f"QMenu::item {{ padding: 6px 24px; }}"
+            f"QMenu::item:selected {{ background: {hover}; }}"
+        )
+        act_edit = menu.addAction("✏️ Edit Annotation")
+        act_edit.triggered.connect(lambda: self.edit_requested.emit(self.annotation_id, global_pos))
+        act_delete = menu.addAction("🗑️ Delete Annotation")
+        act_delete.triggered.connect(lambda: self.delete_requested.emit(self.annotation_id))
+        menu.exec(global_pos)
+
+    def _get_page_view(self):
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, PageView):
+                return parent
+            parent = parent.parent()
+        return None
+
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.edit_requested.emit(self.annotation_id, event.globalPosition().toPoint())
             event.accept()
 
     def enterEvent(self, event):
-        self.hover_entered.emit(self.annotation_id, self.note_text, self.cursor().pos())
+        from PySide6.QtGui import QCursor
+        self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
@@ -386,7 +458,8 @@ class HighlightWidget(QWidget):
         self._hovered = True
         self.update()
         if self.annotation_text:
-            self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, self.cursor().pos())
+            from PySide6.QtGui import QCursor
+            self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
@@ -631,9 +704,25 @@ class PageView(QWidget):
         widget.edit_requested.connect(self._on_annotation_edit_requested)
         widget.hover_entered.connect(self._on_annotation_hover_entered)
         widget.hover_left.connect(self._on_annotation_hover_left)
+        widget.delete_requested.connect(self._on_annotation_delete_requested)
+        widget.moved.connect(self._on_annotation_moved)
         widget.show()
         self.annotation_widgets.append(widget)
         return widget
+
+    def _on_annotation_delete_requested(self, annot_id: int):
+        """Handle annotation icon delete request."""
+        from core import database
+        database.delete_annotation(annot_id)
+        self.remove_annotation_widget(annot_id)
+        pv = self._get_page_view()
+        if pv and hasattr(pv, 'annotation_hover_left'):
+            pv.annotation_hover_left.emit(annot_id)
+
+    def _on_annotation_moved(self, annot_id: int, new_x: float, new_y: float):
+        """Handle annotation icon move - save to database."""
+        from core import database
+        database.update_annotation_position(annot_id, new_x, new_y)
 
     def _on_annotation_edit_requested(self, annot_id: int, global_pos):
         """Forward annotation edit request."""

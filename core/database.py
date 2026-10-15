@@ -376,6 +376,13 @@ def update_annotation_text(annotation_id: int, note_text: str):
         conn.commit()
 
 
+def update_annotation_position(annotation_id: int, x: float, y: float):
+    """Update annotation icon position."""
+    with _get_conn() as conn:
+        conn.execute("UPDATE annotations SET x = ?, y = ? WHERE id = ?", (x, y, annotation_id))
+        conn.commit()
+
+
 def delete_annotation(annotation_id: int):
     """Delete an annotation by id."""
     with _get_conn() as conn:
