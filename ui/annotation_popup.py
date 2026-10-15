@@ -96,20 +96,16 @@ class AnnotationEditPopup(QDialog):
 
 class AnnotationViewPopup:
     """
-    Read-only annotation tooltip using QToolTip.
-    Follows cursor position automatically.
+    Read-only annotation tooltip placeholder.
+    Actual display is handled by QLabel child widgets in widgets.py.
     """
 
     @staticmethod
     def show(text: str, global_pos: QPoint = None):
-        """Show tooltip at cursor position (or given position)."""
-        if not global_pos:
-            global_pos = QCursor.pos()
-        display_text = text if text else "(No note)"
-        # QToolTip handles positioning and styling natively
-        QToolTip.showText(global_pos + QPoint(16, 16), display_text)
+        """No-op - display handled by hover labels in widgets."""
+        pass
 
     @staticmethod
     def hide():
-        """Hide the tooltip."""
-        QToolTip.hideText()
+        """No-op - hide handled by hover labels in widgets."""
+        pass

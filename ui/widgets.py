@@ -16,7 +16,9 @@ from core.theme_colors import get_theme_colors
 def _get_hover_label_style() -> str:
     """Return theme-adaptive stylesheet for hover labels."""
     colors = get_theme_colors()
-    bg = colors.get("popup_bg", "#333333")
+    # Use base color for background, text color for text
+    # This ensures proper contrast in both light and dark themes
+    bg = colors.get("base", "#333333")
     text = colors.get("text", "#ffffff")
     border = colors.get("border", "#555555")
     return (
