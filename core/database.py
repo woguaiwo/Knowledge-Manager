@@ -294,7 +294,11 @@ def init_db():
         if 'entry_type' not in bm_cols:
             conn.execute("ALTER TABLE bookmarks ADD COLUMN entry_type TEXT DEFAULT 'bookmark'")
         # Normalize all bookmark paths to forward slashes
-        conn.execute("UPDATE bookmarks SET pdf_path = REPLACE(pdf_path, '\\', '/') WHERE pdf_path LIKE '%\\%'")
+        backslash = chr(92)  # '\'
+        conn.execute(
+            "UPDATE bookmarks SET pdf_path = REPLACE(pdf_path, ?, '/') WHERE pdf_path LIKE ?",
+            (backslash, '%' + backslash + '%')
+        )
         conn.commit()
 
 
@@ -1008,13 +1012,29 @@ def delete_highlight(highlight_id: int) -> bool:
 # Bookmarks
 # ---------------------------------------------------------------------------
 
+def _get_canonical_pdf_path(conn, pdf_path: str) -> str:
+    """Return the existing path format in DB for this PDF, or the normalized path if new."""
+    normalized = pdf_path.replace('\\', '/')
+    # Check if any bookmarks exist with this path (in any format)
+    row = conn.execute(
+        "SELECT pdf_path FROM bookmarks WHERE pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ? LIMIT 1",
+        (pdf_path, normalized)
+    ).fetchone()
+    if row:
+        return row["pdf_path"]  # Use existing format for consistency
+    return normalized  # Use normalized format for new PDFs
+
+
 def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0, entry_type: str = "bookmark") -> int:
     """Add a bookmark or keyword and return its id."""
     with _get_conn() as conn:
+        # Use consistent path format with existing records
+        canonical_path = _get_canonical_pdf_path(conn, pdf_path)
+
         # Get max sort_order for this parent to append at end
         cursor = conn.execute(
             "SELECT MAX(sort_order) as max_order FROM bookmarks WHERE pdf_path = ? AND parent_id = ?",
-            (pdf_path, parent_id)
+            (canonical_path, parent_id)
         )
         row = cursor.fetchone()
         max_order = row["max_order"] if row["max_order"] is not None else -1
@@ -1023,7 +1043,7 @@ def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0
         cursor = conn.execute(
             "INSERT INTO bookmarks (pdf_path, page_number, title, parent_id, sort_order, entry_type, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (pdf_path, page_number, title, parent_id, new_order, entry_type, datetime.now().isoformat())
+            (canonical_path, page_number, title, parent_id, new_order, entry_type, datetime.now().isoformat())
         )
         conn.commit()
         return cursor.lastrowid
