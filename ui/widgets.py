@@ -236,7 +236,7 @@ class LinkWidget(QWidget):
 
 
 class InstantTooltip(QLabel):
-    """Custom tooltip with zero delay - shows/hides instantly."""
+    """Custom tooltip with zero delay - shows/hides instantly, no animations."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -249,6 +249,7 @@ class InstantTooltip(QLabel):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)  # Prevent auto-delete
         self.setStyleSheet(
             "QLabel {"
             "background: rgba(60, 60, 60, 240);"
@@ -259,6 +260,8 @@ class InstantTooltip(QLabel):
             "font-size: 12px;"
             "}"
         )
+        # Disable any animations
+        self.setWindowOpacity(1.0)
 
     def show_at(self, text: str, global_pos):
         """Show tooltip instantly at given position."""
@@ -267,6 +270,11 @@ class InstantTooltip(QLabel):
         self.move(global_pos + QPoint(16, 16))
         self.show()
         self.raise_()
+
+    def hide(self):
+        """Hide immediately without any fade animation."""
+        self.setWindowOpacity(0.0)  # Force fully transparent first
+        super().hide()
 
 
 class AnnotationIconWidget(QWidget):
@@ -404,6 +412,8 @@ class AnnotationIconWidget(QWidget):
     def leaveEvent(self, event):
         if self._tooltip is not None:
             self._tooltip.hide()
+            self._tooltip.deleteLater()  # Destroy immediately, no fade
+            self._tooltip = None
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
 
@@ -527,6 +537,8 @@ class HighlightWidget(QWidget):
         self.update()
         if self._tooltip is not None:
             self._tooltip.hide()
+            self._tooltip.deleteLater()  # Destroy immediately, no fade
+            self._tooltip = None
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
 
