@@ -352,10 +352,17 @@ class AnnotationIconWidget(QWidget):
 
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
+        from PySide6.QtWidgets import QToolTip
+        # Show tooltip directly - most reliable approach
+        display = self.note_text if self.note_text else "(Double-click to add note)"
+        QToolTip.showText(QCursor.pos(), display, self)
+        # Also emit signal for compatibility
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.hideText()
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
 
@@ -459,12 +466,16 @@ class HighlightWidget(QWidget):
         self.update()
         if self.annotation_text:
             from PySide6.QtGui import QCursor
+            from PySide6.QtWidgets import QToolTip
+            QToolTip.showText(QCursor.pos(), self.annotation_text, self)
             self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self._hovered = False
         self.update()
+        from PySide6.QtWidgets import QToolTip
+        QToolTip.hideText()
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
 
