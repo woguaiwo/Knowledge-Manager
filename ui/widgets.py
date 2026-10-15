@@ -1287,8 +1287,19 @@ class PageView(QWidget):
             self.highlight_widgets.append(hw)
 
     def _on_hw_annotation_edit(self, highlight_id: int, global_pos):
-        """Forward highlight annotation edit to PageView signal."""
-        self.annotation_edit_requested.emit(highlight_id, global_pos)
+        """Forward highlight annotation edit: find/create annotation for this highlight."""
+        if not self.engine or not self.engine.path:
+            return
+        from core import database
+        annot = database.get_annotation_for_target(self.engine.path, "highlight", highlight_id)
+        if annot:
+            self.annotation_edit_requested.emit(annot["id"], global_pos)
+        else:
+            # Create new annotation for this highlight
+            annot_id = database.add_annotation(
+                self.engine.path, self.page_number, 0, 0, "", "highlight", highlight_id
+            )
+            self.annotation_edit_requested.emit(annot_id, global_pos)
 
     def _on_hw_annotation_hover(self, highlight_id: int, text: str, global_pos):
         """Forward highlight annotation hover to PageView signal."""

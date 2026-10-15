@@ -557,11 +557,6 @@ class MainWindow(QMainWindow):
             pv.annotation_hover_entered.connect(self._on_annotation_hover_show)
             pv.annotation_hover_left.connect(self._on_annotation_hover_hide)
             pv.annotation_placed.connect(self._on_annotation_placed)
-            # Also connect highlight annotation signals
-            for hw in pv.highlight_widgets:
-                hw.annotation_edit_requested.connect(self._on_highlight_annotation_edit)
-                hw.annotation_hover_entered.connect(self._on_highlight_annotation_hover)
-                hw.annotation_hover_left.connect(self._on_highlight_annotation_leave)
 
         # Auto-load saved vocabulary if a mapped file exists
         loaded_from_file = database.load_vocab_from_file(path)
@@ -1300,12 +1295,12 @@ class MainWindow(QMainWindow):
             self._show_annotation_edit(annot_id, global_pos, "")
 
     def _on_highlight_annotation_hover(self, highlight_id: int, text: str, global_pos):
-        """Show annotation tooltip for highlight hover."""
-        self._on_annotation_hover_show(highlight_id, text, global_pos)
+        """Show annotation tooltip for highlight hover (unused, kept for compatibility)."""
+        pass
 
     def _on_highlight_annotation_leave(self, highlight_id: int):
-        """Hide annotation tooltip for highlight leave."""
-        self._on_annotation_hover_hide(highlight_id)
+        """Hide annotation tooltip for highlight leave (unused, kept for compatibility)."""
+        pass
 
     def _run_explain_with_image(self, tab, text_prompt: str, image_b64: str, image_mime: str, display_title: str, timer_data: dict | None = None, prompt_key: str = "prompt_explain_image"):
         """Common logic for image-based explain queries."""
