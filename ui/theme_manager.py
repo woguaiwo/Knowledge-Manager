@@ -31,6 +31,7 @@ THEMES = {
         },
         "qss": """
             QMainWindow, QWidget { background: #2b2b2b; color: #eeeeee; }
+            QToolTip { background: #3a3a3a; color: #ffffff; border: 1px solid #555555; padding: 6px 10px; }
             QToolBar { background: #333333; border: none; padding: 4px; }
             QToolButton { color: #eeeeee; padding: 6px 12px; background: transparent; border: none; }
             QToolButton:hover { background: #444444; border-radius: 4px; }
@@ -83,6 +84,7 @@ THEMES = {
         },
         "qss": """
             QMainWindow, QWidget { background: #f5f5f5; color: #222222; }
+            QToolTip { background: #ffffff; color: #222222; border: 1px solid #cccccc; padding: 6px 10px; }
             QToolBar { background: #eaeaea; border: none; padding: 4px; }
             QToolButton { color: #222222; padding: 6px 12px; background: transparent; border: none; }
             QToolButton:hover { background: #dcdcdc; border-radius: 4px; }
@@ -135,6 +137,7 @@ THEMES = {
         },
         "qss": """
             QMainWindow, QWidget { background: #f4f7f2; color: #2f3e2f; }
+            QToolTip { background: #ffffff; color: #2f3e2f; border: 1px solid #b8ccb0; padding: 6px 10px; }
             QToolBar { background: #e4ede0; border: none; padding: 4px; }
             QToolButton { color: #2f3e2f; padding: 6px 12px; background: transparent; border: none; }
             QToolButton:hover { background: #d4e4cc; border-radius: 4px; }
