@@ -235,6 +235,59 @@ class LinkWidget(QWidget):
         event.accept()
 
 
+class AnnotationIconWidget(QWidget):
+    """
+    Small icon placed on PDF page for annotations.
+    Double-click to edit, hover to view.
+    """
+    edit_requested = Signal(int, object)       # annotation_id, global_pos
+    hover_entered = Signal(int, str, object)   # annotation_id, text, global_pos
+    hover_left = Signal(int)                    # annotation_id
+
+    def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", unzoomed_pos: tuple = None, parent=None):
+        super().__init__(parent)
+        self.annotation_id = annotation_id
+        self.note_text = note_text
+        self.unzoomed_pos = unzoomed_pos or (x, y)  # (x, y) in PDF coordinates
+        self.setGeometry(int(x), int(y), int(width), int(height))
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Double-click to edit annotation")
+
+    def update_geometry(self, x: float, y: float, width: float, height: float):
+        self.setGeometry(int(x), int(y), int(width), int(height))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Draw a small circle with a pen icon
+        painter.setBrush(QColor(255, 193, 7, 220))
+        painter.setPen(QPen(QColor(200, 150, 0), 1))
+        painter.drawEllipse(2, 2, self.width() - 4, self.height() - 4)
+        # Draw pen symbol
+        painter.setPen(QPen(QColor(255, 255, 255), 2))
+        font = painter.font()
+        font.setPixelSize(12)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "✎")
+        painter.end()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.edit_requested.emit(self.annotation_id, event.globalPosition().toPoint())
+            event.accept()
+
+    def enterEvent(self, event):
+        self.hover_entered.emit(self.annotation_id, self.note_text, self.cursor().pos())
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hover_left.emit(self.annotation_id)
+        super().leaveEvent(event)
+
+
 class HighlightWidget(QWidget):
     """
     Visual overlay showing a persistent text highlight.
@@ -244,6 +297,9 @@ class HighlightWidget(QWidget):
     highlight_deleted = Signal(int)
     highlight_selected = Signal(int)
     highlight_copied = Signal(str)
+    annotation_edit_requested = Signal(int, object)      # highlight_id, global_pos
+    annotation_hover_entered = Signal(int, str, object)  # highlight_id, text, global_pos
+    annotation_hover_left = Signal(int)                   # highlight_id
 
     def __init__(self, highlight_id: int, color: str, x: float, y: float, width: float, height: float, text: str = "", line_rects: list = None, unzoomed_rect: tuple = None, parent=None):
         super().__init__(parent)
@@ -253,6 +309,7 @@ class HighlightWidget(QWidget):
         self.line_rects = line_rects or []  # list of QRect relative to widget top-left
         # Store unzoomed bbox for fast geometry updates on rescale
         self.unzoomed_rect = unzoomed_rect  # (x, y, width, height) in PDF coordinates
+        self.annotation_text = ""  # attached annotation note
         self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -280,39 +337,6 @@ class HighlightWidget(QWidget):
         self._hovered = False
         self.update()
         super().leaveEvent(event)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        rects = self.line_rects if self.line_rects else [self.rect()]
-
-        # Marker-style underline: colour only the bottom part of each line so
-        # the text above remains perfectly readable.
-        marker = QColor(self.color)
-        marker.setAlpha(160 if self._selected else (130 if self._hovered else 100))
-        for rect in rects:
-            h = max(3, int(rect.height() * 0.35))
-            underline = QRect(rect.x(), rect.y() + rect.height() - h, rect.width(), h)
-            painter.fillRect(underline, marker)
-
-        if self._selected:
-            colors = get_theme_colors()
-            selected_color = QColor(colors.get("selected", "#3a5a8a"))
-            pen = QPen(selected_color)
-            pen.setWidth(2)
-            pen.setStyle(Qt.PenStyle.SolidLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            for rect in rects:
-                painter.drawRect(rect.adjusted(2, 2, -2, -2))
-        elif self._hovered:
-            pen = QPen(QColor(255, 255, 255, 180))
-            pen.setWidth(1)
-            pen.setStyle(Qt.PenStyle.DotLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            for rect in rects:
-                painter.drawRect(rect.adjusted(1, 1, -1, -1))
-        painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -352,6 +376,72 @@ class HighlightWidget(QWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.annotation_edit_requested.emit(self.highlight_id, event.globalPosition().toPoint())
+            event.accept()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        if self.annotation_text:
+            self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, self.cursor().pos())
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        self.annotation_hover_left.emit(self.highlight_id)
+        super().leaveEvent(event)
+
+    def set_annotation_text(self, text: str):
+        """Set attached annotation text and update visual indicator."""
+        self.annotation_text = text
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        rects = self.line_rects if self.line_rects else [self.rect()]
+
+        # Marker-style underline: colour only the bottom part of each line so
+        # the text above remains perfectly readable.
+        marker = QColor(self.color)
+        marker.setAlpha(160 if self._selected else (130 if self._hovered else 100))
+        for rect in rects:
+            h = max(3, int(rect.height() * 0.35))
+            underline = QRect(rect.x(), rect.y() + rect.height() - h, rect.width(), h)
+            painter.fillRect(underline, marker)
+
+        # Draw small indicator dot if annotation exists
+        if self.annotation_text:
+            dot_color = QColor(255, 193, 7, 220)  # Amber
+            painter.setBrush(dot_color)
+            painter.setPen(QPen(QColor(200, 150, 0), 1))
+            first_rect = rects[0]
+            dot_x = first_rect.x() + 2
+            dot_y = first_rect.y() + 2
+            painter.drawEllipse(dot_x, dot_y, 8, 8)
+
+        if self._selected:
+            colors = get_theme_colors()
+            selected_color = QColor(colors.get("selected", "#3a5a8a"))
+            pen = QPen(selected_color)
+            pen.setWidth(2)
+            pen.setStyle(Qt.PenStyle.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for rect in rects:
+                painter.drawRect(rect.adjusted(2, 2, -2, -2))
+        elif self._hovered:
+            pen = QPen(QColor(255, 255, 255, 180))
+            pen.setWidth(1)
+            pen.setStyle(Qt.PenStyle.DotLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for rect in rects:
+                painter.drawRect(rect.adjusted(1, 1, -1, -1))
+        painter.end()
 
 
 class SearchHighlightWidget(QWidget):
@@ -430,6 +520,9 @@ class PageView(QWidget):
     image_clicked = Signal(int, int)  # page_number, image_index
     page_double_clicked = Signal(int)  # page_number
     link_clicked = Signal(dict)  # link data dict
+    annotation_edit_requested = Signal(int, object)      # annotation_id, global_pos
+    annotation_hover_entered = Signal(int, str, object)  # annotation_id, text, global_pos
+    annotation_hover_left = Signal(int)                   # annotation_id
 
     def __init__(self, engine: PdfEngine, page_number: int, zoom: float = 1.5, parent=None):
         super().__init__(parent)
@@ -477,12 +570,18 @@ class PageView(QWidget):
         self.vocab_mode = False
         self.explain_mode = False
         self.highlight_mode = False
+        self.annotation_mode = False
+        self.annotation_widgets: list[AnnotationIconWidget] = []
         self._image_dirty = False
 
         self.load_page()
 
     def _on_overlay_press(self, event):
         local_pos = event.pos()
+        # Annotation mode: place icon at click position
+        if self.annotation_mode:
+            self._place_annotation_at(local_pos)
+            return
         for w in self.word_widgets:
             if w.geometry().contains(local_pos):
                 self.clear_image_selections()
@@ -500,6 +599,94 @@ class PageView(QWidget):
         if self.selected_widgets:
             self.clear_selection()
         self._clear_highlight_selection()
+
+    def _place_annotation_at(self, local_pos):
+        """Place an annotation icon at the given local position."""
+        if not self.engine or not self.engine.path:
+            return
+        from core import database
+        # Convert to unzoomed PDF coordinates
+        pdf_x = local_pos.x() / self.zoom
+        pdf_y = local_pos.y() / self.zoom
+        annot_id = database.add_annotation(
+            self.engine.path, self.page_number,
+            pdf_x, pdf_y, "", "icon", 0, 24, 24
+        )
+        self._create_annotation_widget(annot_id, pdf_x, pdf_y, "")
+        # Exit annotation mode after placing
+        self.annotation_mode = False
+        self.unsetCursor()
+        if self._get_page_view() and hasattr(self._get_page_view(), 'annotation_mode_changed'):
+            pass  # Signal handled by main_window via cursor restore
+
+    def _create_annotation_widget(self, annot_id: int, pdf_x: float, pdf_y: float, note_text: str):
+        """Create an AnnotationIconWidget from PDF coordinates."""
+        widget = AnnotationIconWidget(
+            annot_id,
+            pdf_x * self.zoom, pdf_y * self.zoom,
+            24, 24, note_text,
+            unzoomed_pos=(pdf_x, pdf_y),
+            parent=self.overlay
+        )
+        widget.edit_requested.connect(self._on_annotation_edit_requested)
+        widget.hover_entered.connect(self._on_annotation_hover_entered)
+        widget.hover_left.connect(self._on_annotation_hover_left)
+        widget.show()
+        self.annotation_widgets.append(widget)
+        return widget
+
+    def _on_annotation_edit_requested(self, annot_id: int, global_pos):
+        """Forward annotation edit request."""
+        pv = self._get_page_view()
+        if pv and hasattr(pv, 'annotation_edit_requested'):
+            pv.annotation_edit_requested.emit(annot_id, global_pos)
+
+    def _on_annotation_hover_entered(self, annot_id: int, text: str, global_pos):
+        pv = self._get_page_view()
+        if pv and hasattr(pv, 'annotation_hover_entered'):
+            pv.annotation_hover_entered.emit(annot_id, text, global_pos)
+
+    def _on_annotation_hover_left(self, annot_id: int):
+        pv = self._get_page_view()
+        if pv and hasattr(pv, 'annotation_hover_left'):
+            pv.annotation_hover_left.emit(annot_id)
+
+    def load_annotations(self):
+        """Load annotations for this page from database."""
+        if not self.engine or not self.engine.path:
+            return
+        from core import database
+        annotations = database.get_annotations(self.engine.path, self.page_number)
+        for annot in annotations:
+            if annot["target_type"] == "icon":
+                self._create_annotation_widget(
+                    annot["id"], annot["x"], annot["y"], annot["note_text"]
+                )
+
+    def update_annotation_geometries(self):
+        """Update annotation icon positions after zoom change."""
+        for widget in self.annotation_widgets:
+            if widget.unzoomed_pos:
+                x, y = widget.unzoomed_pos
+                widget.update_geometry(x * self.zoom, y * self.zoom, 24, 24)
+
+    def remove_annotation_widget(self, annot_id: int):
+        """Remove an annotation widget by id."""
+        for widget in self.annotation_widgets[:]:
+            if widget.annotation_id == annot_id:
+                widget.setParent(None)
+                widget.deleteLater()
+                self.annotation_widgets.remove(widget)
+                return True
+        return False
+
+    def set_annotation_mode(self, active: bool):
+        """Enter or exit annotation placement mode."""
+        self.annotation_mode = active
+        if active:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
 
     def _on_overlay_move(self, event):
         if not self.selection_active:
@@ -543,6 +730,7 @@ class PageView(QWidget):
         self._build_image_hit_widgets()
         self._build_link_widgets()
         self._load_highlights()
+        self.load_annotations()
 
     def rescale(self, new_zoom: float, render_image: bool = True):
         """Resize page and word widgets without destroying them."""
@@ -982,6 +1170,10 @@ class PageView(QWidget):
             )
             hw.highlight_deleted.connect(self._on_highlight_deleted)
             hw.highlight_selected.connect(self._on_highlight_selected)
+            # Load annotation for this highlight if exists
+            annot = database.get_annotation_for_target(self.engine.path, "highlight", h["id"])
+            if annot:
+                hw.set_annotation_text(annot["note_text"])
             hw.show()
             self.highlight_widgets.append(hw)
 

@@ -155,6 +155,16 @@ class PdfScrollView(QWidget):
     def set_explain_mode(self, active: bool):
         for pv in self.page_views:
             pv.explain_mode = active
+            # Make highlights transparent to mouse events in explain mode
+            # so users can select text underneath
+            for hw in pv.highlight_widgets:
+                hw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, active)
+            for aw in pv.annotation_widgets:
+                aw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, active)
+
+    def set_annotation_mode(self, active: bool):
+        for pv in self.page_views:
+            pv.set_annotation_mode(active)
 
     def mark_word_collected(self, text: str):
         for pv in self.page_views:

@@ -299,7 +299,100 @@ def init_db():
             "UPDATE bookmarks SET pdf_path = REPLACE(pdf_path, ?, '/') WHERE pdf_path LIKE ?",
             (backslash, '%' + backslash + '%')
         )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS annotations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pdf_path TEXT NOT NULL,
+                page_number INTEGER NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                width REAL DEFAULT 24,
+                height REAL DEFAULT 24,
+                note_text TEXT DEFAULT '',
+                target_type TEXT DEFAULT 'icon',
+                target_id INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Annotations
+# ---------------------------------------------------------------------------
+
+def _get_canonical_pdf_path_annot(conn, pdf_path: str) -> str:
+    """Return existing path format or normalized for annotations."""
+    normalized = pdf_path.replace('\\', '/')
+    row = conn.execute(
+        "SELECT pdf_path FROM annotations WHERE pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ? LIMIT 1",
+        (pdf_path, normalized)
+    ).fetchone()
+    if row:
+        return row["pdf_path"]
+    return normalized
+
+
+def add_annotation(pdf_path: str, page_number: int, x: float, y: float,
+                   note_text: str = "", target_type: str = "icon",
+                   target_id: int = 0, width: float = 24, height: float = 24) -> int:
+    """Add an annotation and return its id."""
+    with _get_conn() as conn:
+        canonical = _get_canonical_pdf_path_annot(conn, pdf_path)
+        cursor = conn.execute(
+            "INSERT INTO annotations (pdf_path, page_number, x, y, width, height, note_text, target_type, target_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (canonical, page_number, x, y, width, height, note_text, target_type, target_id,
+             datetime.now().isoformat())
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_annotations(pdf_path: str, page_number: int = None) -> List[Dict]:
+    """Get annotations for a PDF, optionally filtered by page."""
+    normalized = pdf_path.replace('\\', '/')
+    with _get_conn() as conn:
+        if page_number is not None:
+            rows = conn.execute(
+                "SELECT id, pdf_path, page_number, x, y, width, height, note_text, target_type, target_id, created_at "
+                "FROM annotations WHERE (pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ?) AND page_number = ? "
+                "ORDER BY created_at",
+                (pdf_path, normalized, page_number)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, pdf_path, page_number, x, y, width, height, note_text, target_type, target_id, created_at "
+                "FROM annotations WHERE pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ? ORDER BY page_number, created_at",
+                (pdf_path, normalized)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def update_annotation_text(annotation_id: int, note_text: str):
+    """Update annotation note text."""
+    with _get_conn() as conn:
+        conn.execute("UPDATE annotations SET note_text = ? WHERE id = ?", (note_text, annotation_id))
+        conn.commit()
+
+
+def delete_annotation(annotation_id: int):
+    """Delete an annotation by id."""
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+        conn.commit()
+
+
+def get_annotation_for_target(pdf_path: str, target_type: str, target_id: int) -> Optional[Dict]:
+    """Get annotation attached to a specific target (e.g., a highlight)."""
+    normalized = pdf_path.replace('\\', '/')
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, pdf_path, page_number, x, y, width, height, note_text, target_type, target_id, created_at "
+            "FROM annotations WHERE (pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ?) AND target_type = ? AND target_id = ?",
+            (pdf_path, normalized, target_type, target_id)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 # ---------------------------------------------------------------------------

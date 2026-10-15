@@ -33,6 +33,7 @@ from ui.target_reading_popup import TargetReadingPopup
 from ui.quiz_sidebar import QuizSidebar
 from ui.quiz_tab_widget import QuizTabWidget
 from ui.bookmark_panel import BookmarkPanel
+from ui.annotation_popup import AnnotationEditPopup, AnnotationViewPopup
 
 
 class TargetReadingWorker(QThread):
@@ -186,6 +187,8 @@ class MainWindow(QMainWindow):
         self._undo_stack: list[dict] = []
         self._explain_popup = None
         self._target_popup = None
+        self._annotation_edit_popup = None
+        self._annotation_view_popup = None
         self._target_matches: list[dict] = []
         self._target_active_index: int = -1
         self._target_worker = None
@@ -366,6 +369,11 @@ class MainWindow(QMainWindow):
         self.act_highlight.triggered.connect(self._toggle_highlight_mode)
         self.toolbar.addAction(self.act_highlight)
 
+        self.act_annotation = QAction("📝 Annotate", self)
+        self.act_annotation.setCheckable(True)
+        self.act_annotation.triggered.connect(self._toggle_annotation_mode)
+        self.toolbar.addAction(self.act_annotation)
+
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
@@ -542,6 +550,17 @@ class MainWindow(QMainWindow):
         tab.scroll_view.link_clicked.connect(self._on_link_clicked)
         tab.scroll_view.page_changed.connect(self.note_panel.on_page_changed)
         tab.scroll_view.page_changed.connect(self._on_page_changed_for_bookmark)
+
+        # Connect annotation signals for each page view
+        for pv in tab.scroll_view.page_views:
+            pv.annotation_edit_requested.connect(self._on_annotation_edit_requested)
+            pv.annotation_hover_entered.connect(self._on_annotation_hover_show)
+            pv.annotation_hover_left.connect(self._on_annotation_hover_hide)
+            # Also connect highlight annotation signals
+            for hw in pv.highlight_widgets:
+                hw.annotation_edit_requested.connect(self._on_highlight_annotation_edit)
+                hw.annotation_hover_entered.connect(self._on_highlight_annotation_hover)
+                hw.annotation_hover_left.connect(self._on_highlight_annotation_leave)
 
         # Auto-load saved vocabulary if a mapped file exists
         loaded_from_file = database.load_vocab_from_file(path)
@@ -1188,6 +1207,109 @@ class MainWindow(QMainWindow):
         if tab:
             tab.set_highlight_mode(checked)
             self.status_label.setText("Highlight Mode: ON" if checked else "Highlight Mode: OFF")
+
+    def _toggle_annotation_mode(self, checked: bool):
+        """Toggle annotation placement mode for the current PDF tab."""
+        tab = self._current_tab()
+        if tab and tab.scroll_view:
+            tab.scroll_view.set_annotation_mode(checked)
+            self.status_label.setText(
+                "Annotation Mode: Click on page to place icon" if checked
+                else "Annotation Mode: OFF"
+            )
+
+    def _show_annotation_edit(self, annotation_id: int, global_pos, note_text: str = ""):
+        """Show the editable annotation popup."""
+        if self._annotation_edit_popup:
+            self._annotation_edit_popup.hide()
+            self._annotation_edit_popup = None
+        self._annotation_edit_popup = AnnotationEditPopup(annotation_id, note_text, self)
+        self._annotation_edit_popup.save_requested.connect(self._on_annotation_save)
+        self._annotation_edit_popup.delete_requested.connect(self._on_annotation_delete)
+        self._annotation_edit_popup.closed.connect(self._on_annotation_popup_closed)
+        self._annotation_edit_popup.show_at(global_pos)
+
+    def _on_annotation_save(self, annotation_id: int, text: str):
+        """Save annotation text to database."""
+        database.update_annotation_text(annotation_id, text)
+        # Update widget text
+        tab = self._current_tab()
+        if tab and tab.scroll_view:
+            for pv in tab.scroll_view.page_views:
+                for aw in pv.annotation_widgets:
+                    if aw.annotation_id == annotation_id:
+                        aw.note_text = text
+                for hw in pv.highlight_widgets:
+                    if hasattr(hw, 'set_annotation_text'):
+                        # Check if this highlight has this annotation
+                        annot = database.get_annotation_for_target(
+                            tab.pdf_path, "highlight", hw.highlight_id
+                        )
+                        if annot and annot["id"] == annotation_id:
+                            hw.set_annotation_text(text)
+        self.status_label.setText("Annotation saved.")
+
+    def _on_annotation_delete(self, annotation_id: int):
+        """Delete annotation from database and UI."""
+        database.delete_annotation(annotation_id)
+        tab = self._current_tab()
+        if tab and tab.scroll_view:
+            for pv in tab.scroll_view.page_views:
+                pv.remove_annotation_widget(annotation_id)
+        self.status_label.setText("Annotation deleted.")
+
+    def _on_annotation_popup_closed(self):
+        """Clean up reference when popup closes."""
+        self._annotation_edit_popup = None
+
+    def _on_annotation_hover_show(self, annot_id: int, text: str, global_pos):
+        """Show read-only annotation tooltip following cursor."""
+        if not self._annotation_view_popup:
+            self._annotation_view_popup = AnnotationViewPopup(self)
+        self._annotation_view_popup.set_text(text)
+        self._annotation_view_popup.show_at_cursor(global_pos)
+
+    def _on_annotation_hover_hide(self, annot_id: int):
+        """Hide read-only annotation tooltip."""
+        if self._annotation_view_popup:
+            self._annotation_view_popup.hide_tooltip()
+
+    def _on_annotation_edit_requested(self, annot_id: int, global_pos):
+        """Handle annotation edit request from icon or highlight."""
+        # Get existing text
+        tab = self._current_tab()
+        note_text = ""
+        if tab and tab.pdf_path:
+            annots = database.get_annotations(tab.pdf_path)
+            for a in annots:
+                if a["id"] == annot_id:
+                    note_text = a["note_text"]
+                    break
+        self._show_annotation_edit(annot_id, global_pos, note_text)
+
+    def _on_highlight_annotation_edit(self, highlight_id: int, global_pos):
+        """Handle annotation edit request from highlight double-click."""
+        tab = self._current_tab()
+        if not tab or not tab.pdf_path:
+            return
+        # Check if highlight already has an annotation
+        existing = database.get_annotation_for_target(tab.pdf_path, "highlight", highlight_id)
+        if existing:
+            self._show_annotation_edit(existing["id"], global_pos, existing["note_text"])
+        else:
+            # Create new annotation for this highlight
+            annot_id = database.add_annotation(
+                tab.pdf_path, 0, 0, 0, "", "highlight", highlight_id
+            )
+            self._show_annotation_edit(annot_id, global_pos, "")
+
+    def _on_highlight_annotation_hover(self, highlight_id: int, text: str, global_pos):
+        """Show annotation tooltip for highlight hover."""
+        self._on_annotation_hover_show(highlight_id, text, global_pos)
+
+    def _on_highlight_annotation_leave(self, highlight_id: int):
+        """Hide annotation tooltip for highlight leave."""
+        self._on_annotation_hover_hide(highlight_id)
 
     def _run_explain_with_image(self, tab, text_prompt: str, image_b64: str, image_mime: str, display_title: str, timer_data: dict | None = None, prompt_key: str = "prompt_explain_image"):
         """Common logic for image-based explain queries."""
