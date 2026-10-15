@@ -411,9 +411,7 @@ class AnnotationIconWidget(QWidget):
 
     def leaveEvent(self, event):
         if self._tooltip is not None:
-            self._tooltip.hide()
-            self._tooltip.deleteLater()  # Destroy immediately, no fade
-            self._tooltip = None
+            self._tooltip.hide()  # Just hide, overlay will handle cleanup
         self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
 
@@ -536,9 +534,7 @@ class HighlightWidget(QWidget):
         self._hovered = False
         self.update()
         if self._tooltip is not None:
-            self._tooltip.hide()
-            self._tooltip.deleteLater()  # Destroy immediately, no fade
-            self._tooltip = None
+            self._tooltip.hide()  # Just hide, overlay will handle cleanup
         self.annotation_hover_left.emit(self.highlight_id)
         super().leaveEvent(event)
 
@@ -859,11 +855,38 @@ class PageView(QWidget):
             self.unsetCursor()
 
     def _on_overlay_move(self, event):
+        # Always check if mouse left annotation widgets (for tooltip hide)
+        self._check_tooltip_hide(event.pos())
+        
         if not self.selection_active:
             return
         target = self.widget_at_global(event.globalPosition().toPoint())
         if target and isinstance(target, WordWidget):
             self.add_to_selection(target)
+
+    def _check_tooltip_hide(self, local_pos):
+        """Hide tooltip if mouse is not over any annotation widget or highlight."""
+        # Check if mouse is over any annotation icon
+        for widget in self.annotation_widgets:
+            if widget.geometry().contains(local_pos):
+                return  # Still over an icon, don't hide
+        
+        # Check if mouse is over any highlight with annotation
+        for hw in self.highlight_widgets:
+            if hw.geometry().contains(local_pos) and hw.annotation_text:
+                return  # Still over annotated highlight, don't hide
+        
+        # Mouse left all annotation targets - hide tooltip immediately
+        self._hide_all_tooltips()
+
+    def _hide_all_tooltips(self):
+        """Hide all annotation tooltips immediately."""
+        for widget in self.annotation_widgets:
+            if widget._tooltip is not None:
+                widget._tooltip.hide()
+        for hw in self.highlight_widgets:
+            if hw._tooltip is not None:
+                hw._tooltip.hide()
 
     def _on_overlay_release(self, event):
         if self.selection_active:
