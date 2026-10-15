@@ -293,6 +293,8 @@ def init_db():
         bm_cols = [row['name'] for row in cursor.fetchall()]
         if 'entry_type' not in bm_cols:
             conn.execute("ALTER TABLE bookmarks ADD COLUMN entry_type TEXT DEFAULT 'bookmark'")
+        # Normalize all bookmark paths to forward slashes
+        conn.execute("UPDATE bookmarks SET pdf_path = REPLACE(pdf_path, '\\', '/') WHERE pdf_path LIKE '%\\%'")
         conn.commit()
 
 
@@ -1027,13 +1029,33 @@ def add_bookmark(pdf_path: str, page_number: int, title: str, parent_id: int = 0
         return cursor.lastrowid
 
 
+def _normalize_pdf_path(pdf_path: str) -> str:
+    """Normalize PDF path for consistent matching (handles mixed separators)."""
+    import os
+    return os.path.normpath(pdf_path).replace('\\', '/')
+
+
 def get_bookmarks(pdf_path: str) -> List[Dict]:
-    """Get all bookmarks/keywords for a PDF, ordered by parent_id and sort_order."""
+    """Get all bookmarks/keywords for a PDF, ordered by parent_id and sort_order.
+    
+    Matches paths regardless of separator style (handles forward/backward slash inconsistencies).
+    """
+    normalized = _normalize_pdf_path(pdf_path)
     with _get_conn() as conn:
+        # Try exact match first
         rows = conn.execute(
             "SELECT id, pdf_path, page_number, title, parent_id, sort_order, entry_type, created_at "
             "FROM bookmarks WHERE pdf_path = ? ORDER BY parent_id, sort_order",
             (pdf_path,)
+        ).fetchall()
+        if rows:
+            return [dict(row) for row in rows]
+        
+        # Try normalized match (replace \ with /)
+        rows = conn.execute(
+            "SELECT id, pdf_path, page_number, title, parent_id, sort_order, entry_type, created_at "
+            "FROM bookmarks WHERE REPLACE(pdf_path, '\\', '/') = ? ORDER BY parent_id, sort_order",
+            (normalized,)
         ).fetchall()
         return [dict(row) for row in rows]
 
