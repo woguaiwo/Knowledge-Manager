@@ -255,7 +255,7 @@ class AnnotationIconWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Double-click to edit, drag to move, right-click for menu")
+        # Do NOT set tooltip here - we handle it manually in enterEvent
         self._drag_start = None
         self._dragging = False
 
@@ -739,19 +739,13 @@ class PageView(QWidget):
 
     def _on_annotation_edit_requested(self, annot_id: int, global_pos):
         """Forward annotation edit request."""
-        pv = self._get_page_view()
-        if pv and hasattr(pv, 'annotation_edit_requested'):
-            pv.annotation_edit_requested.emit(annot_id, global_pos)
+        self.annotation_edit_requested.emit(annot_id, global_pos)
 
     def _on_annotation_hover_entered(self, annot_id: int, text: str, global_pos):
-        pv = self._get_page_view()
-        if pv and hasattr(pv, 'annotation_hover_entered'):
-            pv.annotation_hover_entered.emit(annot_id, text, global_pos)
+        self.annotation_hover_entered.emit(annot_id, text, global_pos)
 
     def _on_annotation_hover_left(self, annot_id: int):
-        pv = self._get_page_view()
-        if pv and hasattr(pv, 'annotation_hover_left'):
-            pv.annotation_hover_left.emit(annot_id)
+        self.annotation_hover_left.emit(annot_id)
 
     def load_annotations(self):
         """Load annotations for this page from database."""
