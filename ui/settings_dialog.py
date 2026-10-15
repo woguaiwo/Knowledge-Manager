@@ -156,6 +156,11 @@ class SettingsDialog(QDialog):
         mask_layout.addWidget(self.lbl_mask)
         form.addRow("Mask Amount:", mask_layout)
 
+        self.combo_thinking = QComboBox()
+        self.combo_thinking.addItem("None (rely on model/API config)", "none")
+        self.combo_thinking.addItem("Answer Marker (filter after <ANSWER_START>)", "answer_marker")
+        form.addRow("Thinking Mode:", self.combo_thinking)
+
         # Temperature slider (0.0 - 2.0, step 0.1)
         layout.addLayout(form)
         layout.addSpacing(10)
@@ -223,6 +228,10 @@ class SettingsDialog(QDialog):
         mask_val = int(float(database.get_setting("mask_ratio", "35")))
         self.slider_mask.setValue(mask_val)
         self.lbl_mask.setText(f"{mask_val}%")
+        thinking_mode = database.get_setting("thinking_mode", "none")
+        idx = self.combo_thinking.findData(thinking_mode)
+        if idx >= 0:
+            self.combo_thinking.setCurrentIndex(idx)
 
 
 
@@ -337,6 +346,7 @@ class SettingsDialog(QDialog):
     def _save(self):
         database.save_setting("theme", self.combo_theme.currentData())
         database.save_setting("mask_ratio", str(self.slider_mask.value()))
+        database.save_setting("thinking_mode", self.combo_thinking.currentData())
 
         QMessageBox.information(self, "Saved", "Settings saved successfully.")
         self.accept()

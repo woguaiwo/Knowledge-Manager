@@ -81,43 +81,46 @@ class ExplainQueryWorker(QThread):
     chunk_ready = QSignal(str)
     result_ready = QSignal(str)
 
-    def __init__(self, messages: list, provider: dict, timer_data: dict | None = None):
+    def __init__(self, messages: list, provider: dict, timer_data: dict | None = None, thinking_mode: str = "none"):
         super().__init__()
         self.messages = messages
         self.provider = provider
         self.streaming = bool(provider.get("streaming", True))
         self.timer_data = timer_data or {}
+        self.thinking_mode = thinking_mode  # "none" or "answer_marker"
         self._first_chunk_emitted = False
         self.cancelled = False
-        self._in_think_block = False
+        self._answer_started = False
+        self._pending_buffer = ""
 
-    def _filter_chunk(self, chunk: str) -> str:
-        """Remove <think>...</think> blocks from a streaming chunk."""
-        result = []
-        i = 0
-        while i < len(chunk):
-            if self._in_think_block:
-                end = chunk.find('</think>', i)
-                if end == -1:
-                    # Still inside a think block; skip the rest of this chunk
-                    return ''.join(result)
-                i = end + len('</think>')
-                self._in_think_block = False
-            else:
-                start = chunk.find('<think>', i)
-                if start == -1:
-                    result.append(chunk[i:])
-                    break
-                result.append(chunk[i:start])
-                i = start + len('<think>')
-                self._in_think_block = True
-        return ''.join(result)
+    def _filter_answer_marker_chunk(self, chunk: str) -> str:
+        """Only emit content after triple <ANSWER_START><ANSWER_START><ANSWER_START> marker."""
+        if self._answer_started:
+            # Already started; emit everything
+            return chunk
+
+        self._pending_buffer += chunk
+        marker = "<ANSWER_START><ANSWER_START><ANSWER_START>"
+        idx = self._pending_buffer.find(marker)
+
+        if idx == -1:
+            # Triple marker not found yet; emit nothing, keep buffering
+            return ""
+
+        # Triple marker found; emit everything after it
+        self._answer_started = True
+        result = self._pending_buffer[idx + len(marker):]
+        self._pending_buffer = ""
+        return result.lstrip()
 
     @staticmethod
-    def _strip_think_blocks(text: str) -> str:
-        """Remove all <think>...</think> blocks from a complete text."""
-        import re
-        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    def _strip_answer_marker(text: str) -> str:
+        """Remove everything before and including the triple marker."""
+        marker = "<ANSWER_START><ANSWER_START><ANSWER_START>"
+        idx = text.find(marker)
+        if idx == -1:
+            return text
+        return text[idx + len(marker):].lstrip()
 
     def run(self):
         import time
@@ -140,10 +143,11 @@ class ExplainQueryWorker(QThread):
                     if chunk.startswith("Error:"):
                         self.result_ready.emit(chunk)
                         return
-                    filtered = self._filter_chunk(chunk)
-                    if filtered:
-                        full_text += filtered
-                        self.chunk_ready.emit(filtered)
+                    if self.thinking_mode == "answer_marker":
+                        chunk = self._filter_answer_marker_chunk(chunk)
+                    if chunk:
+                        full_text += chunk
+                        self.chunk_ready.emit(chunk)
                 self.timer_data["result_ready"] = time.perf_counter()
                 self.result_ready.emit(full_text)
             else:
@@ -161,9 +165,10 @@ class ExplainQueryWorker(QThread):
                 if result.startswith("Error:"):
                     self.result_ready.emit(result)
                     return
-                cleaned = self._strip_think_blocks(result)
-                self.chunk_ready.emit(cleaned)
-                self.result_ready.emit(cleaned)
+                if self.thinking_mode == "answer_marker":
+                    result = self._strip_answer_marker(result)
+                self.chunk_ready.emit(result)
+                self.result_ready.emit(result)
         except Exception as e:
             self.result_ready.emit(f"Error: {str(e)}")
 
@@ -356,6 +361,25 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
+
+    def _get_thinking_mode(self) -> str:
+        """Return the configured thinking mode: 'none' or 'answer_marker'."""
+        return database.get_setting("thinking_mode", "none")
+
+    def _build_explain_system(self, prompt_key: str) -> str:
+        """Build system prompt with mandatory marker instruction for answer_marker mode."""
+        base = prompt_manager.get_prompt(prompt_key).get("system", "")
+        if self._get_thinking_mode() == "answer_marker":
+            base += (
+                " IMPORTANT: A filter program is monitoring your output. To prevent false triggers, "
+                "you must NEVER write the sequence <ANSWER_START> during your reasoning or planning. "
+                "Only when you are completely certain that the very next text will be your final answer, "
+                "output <ANSWER_START> three times consecutively with no spaces, then immediately write "
+                "your answer. If you write this marker prematurely, the filter will cut off your actual answer "
+                "and the user will see nothing. Be absolutely sure before you emit it."
+            )
+        return base
+
     def _current_tab(self) -> PdfTabWidget | None:
         idx = self.tab_widget.currentIndex()
         if idx < 0:
@@ -650,7 +674,7 @@ class MainWindow(QMainWindow):
                 return
             tab.explain_ready = True
             tab.explain_messages = [
-                {"role": "system", "content": prompt_manager.get_prompt("prompt_explain_selection").get("system", "")}
+                {"role": "system", "content": self._build_explain_system("prompt_explain_selection")}
             ]
             self.status_label.setText("Explain Mode: ON")
         else:
@@ -907,7 +931,7 @@ class MainWindow(QMainWindow):
         # Reset conversation for each new word/phrase, keeping only system prompt
         cfg = prompt_manager.get_prompt("prompt_explain_selection")
         tab.explain_messages = [
-            {"role": "system", "content": cfg.get("system", "")}
+            {"role": "system", "content": self._build_explain_system("prompt_explain_selection")}
         ]
 
         user_template = cfg.get("user")
@@ -924,7 +948,7 @@ class MainWindow(QMainWindow):
             popup.set_thinking(False)
             return
 
-        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider)
+        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, thinking_mode=self._get_thinking_mode())
         tab._explain_worker = worker
 
         def on_chunk(chunk):
@@ -982,7 +1006,7 @@ class MainWindow(QMainWindow):
             popup.append_text("[Error] No AI provider configured.")
             popup.set_thinking(False)
             return
-        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider)
+        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, thinking_mode=self._get_thinking_mode())
         tab._explain_worker = worker
 
         def on_chunk(chunk):
@@ -1147,7 +1171,7 @@ class MainWindow(QMainWindow):
         popup.show_near_cursor()
 
         tab.explain_messages = [
-            {"role": "system", "content": prompt_manager.get_prompt(prompt_key).get("system", "")}
+            {"role": "system", "content": self._build_explain_system(prompt_key)}
         ]
 
         multimodal_content = [
@@ -1164,7 +1188,7 @@ class MainWindow(QMainWindow):
             return
 
         timer["before_worker"] = time.perf_counter()
-        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, timer_data=timer)
+        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, timer_data=timer, thinking_mode=self._get_thinking_mode())
         tab._explain_worker = worker
 
         def on_chunk(chunk):

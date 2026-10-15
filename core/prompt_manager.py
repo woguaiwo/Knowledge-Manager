@@ -32,9 +32,7 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
         "system": (
             "You are a helpful reading assistant. The user is reading a document "
             "and will ask you to explain words or phrases. Reply in Chinese with "
-            "detailed explanations including definition and usage. "
-            "Do NOT output your internal reasoning, chain-of-thought, or <think> tags; "
-            "only output the final explanation."
+            "detailed explanations including definition and usage."
         ),
         "user": '请解释这个词/短语："{selected_text}"{context}\n请用中文详细解释，包括定义和用法。',
     },
@@ -42,9 +40,7 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
         "system": (
             "You are a helpful reading assistant. The user is reading a document "
             "and may ask you to explain images or pages. Reply in Chinese with "
-            "detailed explanations. "
-            "Do NOT output your internal reasoning, chain-of-thought, or <think> tags; "
-            "only output the final explanation."
+            "detailed explanations."
         ),
         "user": "请解释这张图片的内容和含义",
     },
@@ -52,9 +48,7 @@ DEFAULT_PROMPTS: Dict[str, Dict[str, str]] = {
         "system": (
             "You are a helpful reading assistant. The user is reading a document "
             "and may ask you to explain images or pages. Reply in Chinese with "
-            "detailed explanations. "
-            "Do NOT output your internal reasoning, chain-of-thought, or <think> tags; "
-            "only output the final explanation."
+            "detailed explanations."
         ),
         "user": "请解释这个页面的内容",
     },
