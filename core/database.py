@@ -376,10 +376,19 @@ def update_annotation_text(annotation_id: int, note_text: str):
         conn.commit()
 
 
-def update_annotation_position(annotation_id: int, x: float, y: float):
-    """Update annotation icon position."""
+def update_annotation_position(annotation_id: int, x: float, y: float, page_number: int = None):
+    """Update an annotation icon position, optionally moving it to another page."""
     with _get_conn() as conn:
-        conn.execute("UPDATE annotations SET x = ?, y = ? WHERE id = ?", (x, y, annotation_id))
+        if page_number is None:
+            conn.execute(
+                "UPDATE annotations SET x = ?, y = ? WHERE id = ?",
+                (x, y, annotation_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE annotations SET page_number = ?, x = ?, y = ? WHERE id = ?",
+                (page_number, x, y, annotation_id),
+            )
         conn.commit()
 
 

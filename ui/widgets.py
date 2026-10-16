@@ -315,6 +315,9 @@ class AnnotationIconWidget(QWidget):
     hover_left = Signal(int)                    # annotation_id
     delete_requested = Signal(int)              # annotation_id
     moved = Signal(int, float, float)           # annotation_id, new_pdf_x, new_pdf_y
+    drag_started = Signal(object)                # global QPoint
+    drag_moved = Signal(object)                 # global QPoint
+    drag_finished = Signal(object)              # global QPoint
 
     def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", unzoomed_pos: tuple = None, parent=None):
         super().__init__(parent)
@@ -326,6 +329,7 @@ class AnnotationIconWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._drag_start = None
+        self._drag_offset = None
         self._dragging = False
         # Floating label for hover display (child widget, not a separate window)
         self._hover_label = None
@@ -351,7 +355,9 @@ class AnnotationIconWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self.raise_()
             self._drag_start = event.globalPosition().toPoint()
+            self._drag_offset = event.position().toPoint()
             self._dragging = False
             event.accept()
         elif event.button() == Qt.MouseButton.RightButton:
@@ -367,8 +373,9 @@ class AnnotationIconWidget(QWidget):
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
                 if self._hover_label is not None:
                     self._hover_label.hide()
+                self.drag_started.emit(current)
             if self._dragging:
-                self.move(self.x() + delta.x(), self.y() + delta.y())
+                self.drag_moved.emit(current)
                 self._drag_start = current
                 event.accept()
                 return
@@ -381,17 +388,13 @@ class AnnotationIconWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
             was_dragging = self._dragging
-            if was_dragging:
-                # Save new position to database
-                pv = self._get_page_view()
-                if pv:
-                    new_pdf_x = self.x() / pv.zoom
-                    new_pdf_y = self.y() / pv.zoom
-                    self.unzoomed_pos = (new_pdf_x, new_pdf_y)
-                    self.moved.emit(self.annotation_id, new_pdf_x, new_pdf_y)
+            global_pos = event.globalPosition().toPoint()
             self._dragging = False
             self._drag_start = None
+            self._drag_offset = None
             self.setCursor(Qt.CursorShape.PointingHandCursor)
+            if was_dragging:
+                self.drag_finished.emit(global_pos)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -704,6 +707,9 @@ class PageView(QWidget):
     annotation_hover_entered = Signal(int, str, object)  # annotation_id, text, global_pos
     annotation_hover_left = Signal(int)                   # annotation_id
     annotation_placed = Signal(int, object)              # annotation_id, global_pos
+    annotation_drag_started = Signal(object, object)      # widget, global_pos
+    annotation_drag_moved = Signal(object, object)        # widget, global_pos
+    annotation_drag_finished = Signal(object, object)     # widget, global_pos
 
     def __init__(self, engine: PdfEngine, page_number: int, zoom: float = 1.5, parent=None):
         super().__init__(parent)
@@ -815,7 +821,9 @@ class PageView(QWidget):
         widget.hover_entered.connect(self._on_annotation_hover_entered)
         widget.hover_left.connect(self._on_annotation_hover_left)
         widget.delete_requested.connect(self._on_annotation_delete_requested)
-        widget.moved.connect(self._on_annotation_moved)
+        widget.drag_started.connect(self._on_annotation_drag_started)
+        widget.drag_moved.connect(self._on_annotation_drag_moved)
+        widget.drag_finished.connect(self._on_annotation_drag_finished)
         widget.show()
         widget.raise_()  # Ensure it's on top of overlay children
         self.annotation_widgets.append(widget)
@@ -826,15 +834,31 @@ class PageView(QWidget):
         """Handle annotation icon delete request."""
         from core import database
         database.delete_annotation(annot_id)
-        self.remove_annotation_widget(annot_id)
-        pv = self._get_page_view()
-        if pv and hasattr(pv, 'annotation_hover_left'):
-            pv.annotation_hover_left.emit(annot_id)
+        removed = self.remove_annotation_widget(annot_id)
+        if not removed:
+            scroll_view = self._get_pdf_scroll_view()
+            if scroll_view is not None:
+                for page_view in scroll_view.page_views:
+                    if page_view.remove_annotation_widget(annot_id):
+                        break
+        self.annotation_hover_left.emit(annot_id)
 
-    def _on_annotation_moved(self, annot_id: int, new_x: float, new_y: float):
-        """Handle annotation icon move - save to database."""
-        from core import database
-        database.update_annotation_position(annot_id, new_x, new_y)
+    def _get_pdf_scroll_view(self):
+        parent = self.parent()
+        while parent:
+            if hasattr(parent, "page_views") and hasattr(parent, "container"):
+                return parent
+            parent = parent.parent()
+        return None
+
+    def _on_annotation_drag_started(self, global_pos):
+        self.annotation_drag_started.emit(self.sender(), global_pos)
+
+    def _on_annotation_drag_moved(self, global_pos):
+        self.annotation_drag_moved.emit(self.sender(), global_pos)
+
+    def _on_annotation_drag_finished(self, global_pos):
+        self.annotation_drag_finished.emit(self.sender(), global_pos)
 
     def _on_annotation_edit_requested(self, annot_id: int, global_pos):
         """Forward annotation edit request."""
@@ -989,6 +1013,7 @@ class PageView(QWidget):
         self.image_label.setPixmap(pixmap)
         self._image_dirty = False
         self.overlay.raise_()
+        self._raise_annotation_widgets()
 
     def _build_word_widgets(self):
         for w in self.word_widgets:
@@ -1072,10 +1097,17 @@ class PageView(QWidget):
             iw.image_clicked.connect(self.image_clicked)
             iw.show()
             self.image_hit_widgets.append(iw)
+        self._raise_annotation_widgets()
 
     def _update_image_hit_widgets(self):
         """Rebuild image hit widgets after zoom change (simpler than matching by index)."""
         self._build_image_hit_widgets()
+
+    def _raise_annotation_widgets(self):
+        """Keep annotation icons above image and link hit areas."""
+        for widget in self.annotation_widgets:
+            if widget.parentWidget() is self.overlay:
+                widget.raise_()
 
     def widget_at_global(self, global_pos):
         """Find WordWidget under global cursor position using geometry."""

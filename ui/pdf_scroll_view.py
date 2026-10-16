@@ -1,7 +1,7 @@
 """
 Scrollable view that hosts multiple PageView widgets for a PDF document.
 """
-from PySide6.QtCore import Qt, Signal, QEvent, QTimer
+from PySide6.QtCore import Qt, Signal, QEvent, QTimer, QPoint
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QSizePolicy, QLabel
 
 from core.pdf_engine import PdfEngine
@@ -24,6 +24,7 @@ class PdfScrollView(QWidget):
         self.engine: PdfEngine | None = None
         self.page_views: list[PageView] = []
         self.zoom = 1.5
+        self._annotation_drag = None
         self._pending_zoom_delta = 0.0
         self._zoom_timer = QTimer(self)
         self._zoom_timer.setSingleShot(True)
@@ -77,15 +78,135 @@ class PdfScrollView(QWidget):
             pv.image_clicked.connect(self.image_clicked)
             pv.page_double_clicked.connect(self.page_double_clicked)
             pv.link_clicked.connect(self.link_clicked)
+            pv.annotation_drag_started.connect(self._begin_annotation_drag)
+            pv.annotation_drag_moved.connect(self._move_annotation_drag)
+            pv.annotation_drag_finished.connect(self._finish_annotation_drag)
             self.container_layout.addWidget(pv)
             self.page_views.append(pv)
 
     def clear(self):
+        if self._annotation_drag is not None:
+            self._cancel_annotation_drag()
         for pv in self.page_views:
             self.container_layout.removeWidget(pv)
             pv.deleteLater()
         self.page_views.clear()
         self.engine = None
+
+    def _page_for_annotation_widget(self, widget):
+        for pv in self.page_views:
+            if widget in pv.annotation_widgets:
+                return pv
+        return None
+
+    def _page_at_global(self, global_pos):
+        for pv in self.page_views:
+            if pv.rect().contains(pv.mapFromGlobal(global_pos)):
+                return pv
+        return None
+
+    @staticmethod
+    def _set_annotation_parent(widget, parent):
+        """Reparent a dragged icon while preserving its global position."""
+        global_top_left = widget.mapToGlobal(QPoint(0, 0))
+        hover_label = getattr(widget, "_hover_label", None)
+        if hover_label is not None:
+            hover_label.hide()
+            hover_label.setParent(parent)
+        widget.setParent(parent)
+        widget.move(parent.mapFromGlobal(global_top_left))
+        widget.show()
+        widget.raise_()
+
+    def _begin_annotation_drag(self, widget, global_pos):
+        if self._annotation_drag is not None:
+            return
+        source_page = self._page_for_annotation_widget(widget)
+        if source_page is None:
+            return
+
+        self._annotation_drag = {
+            "widget": widget,
+            "source_page": source_page,
+            "drop_page": source_page,
+            "offset": getattr(widget, "_drag_offset", None) or widget.mapFromGlobal(global_pos),
+        }
+        # The container spans all PDF pages, so the icon remains visible while
+        # the pointer crosses a page boundary.
+        self._set_annotation_parent(widget, self.container)
+        widget.grabMouse()
+        self._move_annotation_drag(widget, global_pos)
+
+    def _move_annotation_drag(self, widget, global_pos):
+        state = self._annotation_drag
+        if state is None or state["widget"] is not widget:
+            return
+        if widget.parentWidget() is not self.container:
+            self._set_annotation_parent(widget, self.container)
+
+        offset = state["offset"]
+        top_left = global_pos - offset
+        widget.move(self.container.mapFromGlobal(top_left))
+        widget.raise_()
+
+        target_page = self._page_at_global(global_pos)
+        if target_page is not None:
+            state["drop_page"] = target_page
+
+    def _finish_annotation_drag(self, widget, global_pos):
+        state = self._annotation_drag
+        if state is None or state["widget"] is not widget:
+            return
+        self._move_annotation_drag(widget, global_pos)
+
+        target_page = self._page_at_global(global_pos) or state["drop_page"] or state["source_page"]
+        offset = state["offset"]
+        top_left = global_pos - offset
+        target_pos = target_page.overlay.mapFromGlobal(top_left)
+        max_x = max(0, target_page.overlay.width() - widget.width())
+        max_y = max(0, target_page.overlay.height() - widget.height())
+        target_x = max(0, min(target_pos.x(), max_x))
+        target_y = max(0, min(target_pos.y(), max_y))
+
+        self._set_annotation_parent(widget, target_page.overlay)
+        widget.move(target_x, target_y)
+        widget.raise_()
+
+        for pv in self.page_views:
+            if widget in pv.annotation_widgets:
+                pv.annotation_widgets.remove(widget)
+        if widget not in target_page.annotation_widgets:
+            target_page.annotation_widgets.append(widget)
+
+        new_pdf_x = target_x / target_page.zoom
+        new_pdf_y = target_y / target_page.zoom
+        widget.unzoomed_pos = (new_pdf_x, new_pdf_y)
+        from core import database
+        database.update_annotation_position(
+            widget.annotation_id,
+            new_pdf_x,
+            new_pdf_y,
+            page_number=target_page.page_number,
+        )
+        try:
+            widget.releaseMouse()
+        except Exception:
+            pass
+        self._annotation_drag = None
+
+    def _cancel_annotation_drag(self):
+        state = self._annotation_drag
+        if state is None:
+            return
+        widget = state["widget"]
+        source_page = state["source_page"]
+        if widget.parentWidget() is self.container:
+            self._set_annotation_parent(widget, source_page.overlay)
+        try:
+            widget.releaseMouse()
+        except Exception:
+            pass
+        self._annotation_drag = None
 
     def rescale(self, new_zoom: float):
         if not self.engine or new_zoom == self.zoom:
