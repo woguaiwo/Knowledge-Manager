@@ -32,6 +32,56 @@ def _get_hover_label_style() -> str:
         "}"
     )
 
+
+_HOVER_LABEL_MAX_WIDTH = 270
+_HOVER_LABEL_MARGIN = 8
+
+
+def _prepare_hover_label(label: QLabel, text: str):
+    """Size a hover label so long notes wrap inside a readable box."""
+    parent = label.parentWidget()
+    available_width = parent.width() - (_HOVER_LABEL_MARGIN * 2) if parent else 0
+    max_width = _HOVER_LABEL_MAX_WIDTH
+    if available_width > 0:
+        max_width = min(max_width, available_width)
+
+    label.setWordWrap(True)
+    label.setMinimumWidth(0)
+    label.setMaximumWidth(max_width)
+    label.setText(text)
+
+    # Keep short notes compact while capping long notes at max_width.
+    longest_line = max(
+        (label.fontMetrics().horizontalAdvance(line) for line in text.splitlines()),
+        default=0,
+    )
+    content_width = longest_line + 22  # stylesheet padding plus border
+    label.setFixedWidth(min(max_width, max(80, content_width)))
+    label.adjustSize()
+
+
+def _position_hover_label(anchor: QWidget, label: QLabel, offset: QPoint):
+    """Place a hover label beside its anchor without leaving the page overlay."""
+    parent = anchor.parentWidget()
+    if parent is None:
+        return
+
+    anchor_pos = anchor.mapTo(parent, QPoint(0, 0))
+    x = anchor_pos.x() + offset.x()
+    y = anchor_pos.y() + offset.y()
+    margin = _HOVER_LABEL_MARGIN
+
+    # Prefer the requested side, then flip horizontally/vertically if needed.
+    if x + label.width() > parent.width() - margin:
+        x = anchor_pos.x() - label.width() - margin
+    if y + label.height() > parent.height() - margin:
+        y = anchor_pos.y() - label.height() - margin
+
+    x = max(margin, min(x, max(margin, parent.width() - label.width() - margin)))
+    y = max(margin, min(y, max(margin, parent.height() - label.height() - margin)))
+    label.move(x, y)
+
+
 logger = get_logger()
 
 
@@ -325,8 +375,7 @@ class AnnotationIconWidget(QWidget):
 
         # Keep the hover hint next to the icon while the cursor moves over it.
         if self._hover_label is not None and self._hover_label.isVisible():
-            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
-            self._hover_label.move(local_pos + QPoint(28, 0))
+            _position_hover_label(self, self._hover_label, QPoint(28, 0))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -387,11 +436,8 @@ class AnnotationIconWidget(QWidget):
             self._hover_label.setStyleSheet(_get_hover_label_style())
             self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         display = self.note_text if self.note_text else "(Double-click to add note)"
-        self._hover_label.setText(display)
-        self._hover_label.adjustSize()
-        # Position next to the icon
-        local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
-        self._hover_label.move(local_pos + QPoint(28, 0))
+        _prepare_hover_label(self._hover_label, display)
+        _position_hover_label(self, self._hover_label, QPoint(28, 0))
         self._hover_label.show()
         self._hover_label.raise_()
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
@@ -508,11 +554,8 @@ class HighlightWidget(QWidget):
                 self._hover_label = QLabel(self.parentWidget())
                 self._hover_label.setStyleSheet(_get_hover_label_style())
                 self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            self._hover_label.setText(self.annotation_text)
-            self._hover_label.adjustSize()
-            # Position next to the highlight
-            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
-            self._hover_label.move(local_pos + QPoint(10, -30))
+            _prepare_hover_label(self._hover_label, self.annotation_text)
+            _position_hover_label(self, self._hover_label, QPoint(10, -30))
             self._hover_label.show()
             self._hover_label.raise_()
             self.annotation_hover_entered.emit(self.highlight_id, self.annotation_text, QCursor.pos())
@@ -529,8 +572,7 @@ class HighlightWidget(QWidget):
     def mouseMoveEvent(self, event):
         # Update hover label position when cursor moves while hovering
         if self._hover_label is not None and self._hover_label.isVisible():
-            local_pos = self.mapTo(self.parentWidget(), QPoint(0, 0))
-            self._hover_label.move(local_pos + QPoint(10, -30))
+            _position_hover_label(self, self._hover_label, QPoint(10, -30))
         super().mouseMoveEvent(event)
 
     def set_annotation_text(self, text: str):
