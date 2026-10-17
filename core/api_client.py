@@ -24,6 +24,211 @@ from core.logger import get_logger
 _logger = get_logger()
 
 
+# Reasoning-capable models expose their internal trace in several different
+# ways. Some providers use a separate reasoning_content/reasoning field, while
+# others put <think> or <analysis> tags directly in content. The UI should
+# receive the final answer only, so these markers are handled at the API
+# boundary before any streaming text reaches a widget or chat history.
+_REASONING_START_MARKERS = (
+    "<think>",
+    "<thinking>",
+    "<analysis>",
+    "<reasoning>",
+    "<thought>",
+    "<deliberation>",
+    "<|thinking|>",
+    "<|begin_of_thought|>",
+    "<|channel|>analysis<|message|>",
+    "<|channel|>reasoning<|message|>",
+    "### analysis",
+    "### reasoning",
+    "### thought",
+    "### thinking",
+)
+_REASONING_LINE_START_MARKERS = (
+    "analysis:",
+    "reasoning:",
+    "thinking:",
+    "thought:",
+    "思考：",
+    "思考:",
+    "分析：",
+    "分析:",
+    "推理过程：",
+    "推理过程:",
+)
+_REASONING_END_MARKERS = (
+    "</think>",
+    "</thinking>",
+    "</analysis>",
+    "</reasoning>",
+    "</thought>",
+    "</deliberation>",
+    "<|endofthinking|>",
+    "<|end_of_thought|>",
+    "<|channel|>final<|message|>",
+    "### final answer",
+    "### answer",
+)
+_REASONING_LINE_END_MARKERS = (
+    "final answer:",
+    "final:",
+    "answer:",
+    "最终答案：",
+    "最终答案:",
+    "答案：",
+    "答案:",
+    "结论：",
+    "结论:",
+)
+
+
+class _ReasoningContentFilter:
+    """Remove model reasoning while preserving arbitrary chunk boundaries."""
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_reasoning = False
+
+    @staticmethod
+    def _find_marker(text: str, markers: tuple[str, ...], line_start_only: bool = False):
+        lowered = text.lower()
+        found = []
+        for marker in markers:
+            search_from = 0
+            while True:
+                index = lowered.find(marker, search_from)
+                if index < 0:
+                    break
+                if not line_start_only or index == 0 or text[index - 1] in "\r\n":
+                    found.append((index, marker))
+                    break
+                search_from = index + 1
+        if not found:
+            return None
+        return min(found, key=lambda item: item[0])
+
+    @staticmethod
+    def _trailing_marker_prefix_length(text: str, markers: tuple[str, ...]) -> int:
+        """Keep a suffix that may be the beginning of a split marker."""
+        lowered = text.lower()
+        longest = 0
+        for marker in markers:
+            max_length = min(len(marker) - 1, len(lowered))
+            for length in range(1, max_length + 1):
+                if lowered.endswith(marker[:length]):
+                    longest = max(longest, length)
+        return longest
+
+    def feed(self, chunk: str) -> str:
+        """Consume one provider chunk and return only safe answer text."""
+        if not chunk:
+            return ""
+        self._buffer += str(chunk)
+        output = []
+
+        while self._buffer:
+            if self._in_reasoning:
+                end_candidates = [
+                    self._find_marker(self._buffer, _REASONING_END_MARKERS),
+                    self._find_marker(
+                        self._buffer, _REASONING_LINE_END_MARKERS, line_start_only=True
+                    ),
+                ]
+                end_candidates = [candidate for candidate in end_candidates if candidate]
+                end = min(end_candidates, key=lambda item: item[0]) if end_candidates else None
+                if end is None:
+                    keep = self._trailing_marker_prefix_length(
+                        self._buffer, _REASONING_END_MARKERS + _REASONING_LINE_END_MARKERS
+                    )
+                    if keep:
+                        self._buffer = self._buffer[-keep:]
+                    else:
+                        self._buffer = ""
+                    break
+                index, marker = end
+                self._buffer = self._buffer[index + len(marker):]
+                self._in_reasoning = False
+                continue
+
+            start_candidates = [
+                self._find_marker(self._buffer, _REASONING_START_MARKERS),
+                self._find_marker(
+                    self._buffer, _REASONING_LINE_START_MARKERS, line_start_only=True
+                ),
+            ]
+            end_candidates = [
+                self._find_marker(self._buffer, _REASONING_END_MARKERS),
+                self._find_marker(
+                    self._buffer, _REASONING_LINE_END_MARKERS, line_start_only=True
+                ),
+            ]
+            start_candidates = [candidate for candidate in start_candidates if candidate]
+            end_candidates = [candidate for candidate in end_candidates if candidate]
+            start = min(start_candidates, key=lambda item: item[0]) if start_candidates else None
+            end = min(end_candidates, key=lambda item: item[0]) if end_candidates else None
+            candidates = [item for item in (start, end) if item is not None]
+            if not candidates:
+                keep = self._trailing_marker_prefix_length(
+                    self._buffer,
+                    _REASONING_START_MARKERS
+                    + _REASONING_LINE_START_MARKERS
+                    + _REASONING_END_MARKERS
+                    + _REASONING_LINE_END_MARKERS,
+                )
+                safe_length = len(self._buffer) - keep
+                if safe_length:
+                    output.append(self._buffer[:safe_length])
+                    self._buffer = self._buffer[safe_length:]
+                break
+
+            index, marker = min(candidates, key=lambda item: item[0])
+            if start is not None and index == start[0] and marker == start[1]:
+                output.append(self._buffer[:index])
+                self._buffer = self._buffer[index + len(marker):]
+                self._in_reasoning = True
+            else:
+                # A dangling end marker can occur when the provider sends the
+                # opening tag in a separate reasoning field. Remove it too.
+                output.append(self._buffer[:index])
+                self._buffer = self._buffer[index + len(marker):]
+
+        return "".join(output)
+
+    def finish(self) -> str:
+        """Flush a final safe suffix at end of a response."""
+        if self._in_reasoning:
+            self._buffer = ""
+            return ""
+        result = self._buffer
+        self._buffer = ""
+        return result
+
+
+def _message_content(message: Dict) -> str:
+    """Extract assistant content without falling back to reasoning fields."""
+    content = message.get("content", "") if isinstance(message, dict) else ""
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") in (
+                None, "text", "output_text", "input_text"
+            ):
+                parts.append(str(part.get("text", "")))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Remove embedded reasoning blocks from a complete response."""
+    if not text:
+        return ""
+    content_filter = _ReasoningContentFilter()
+    return content_filter.feed(text) + content_filter.finish()
+
+
 
 
 def _resolve_url(base_url: str) -> str:
@@ -141,7 +346,7 @@ def explain_chat(
     base_url: str,
     api_key: str,
     model: str,
-    proxy: str = ""
+    proxy: str = "",
 ) -> str:
     """
     Send a chat conversation to AI API.
@@ -193,7 +398,8 @@ def explain_chat(
             )
         data = resp.json()
         if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"]
+            content = _message_content(data["choices"][0].get("message", {}))
+            return _strip_reasoning(content)
         return "Error: Unexpected API response format."
     except requests.exceptions.RequestException as e:
         return f"Error: API request failed. {str(e)}"
@@ -208,7 +414,7 @@ def explain_chat_stream(
     model: str,
     proxy: str = "",
     temperature: float = 0.7,
-    max_tokens: int = 4096
+    max_tokens: int = 4096,
 ):
     """
     Send a chat conversation to AI API with streaming (SSE).
@@ -271,7 +477,8 @@ def explain_chat_stream(
             try:
                 data = resp.json()
                 if "choices" in data and len(data["choices"]) > 0:
-                    content = data["choices"][0]["message"]["content"]
+                    content = _message_content(data["choices"][0].get("message", {}))
+                    content = _strip_reasoning(content)
                     if content:
                         yield content
                 else:
@@ -281,6 +488,7 @@ def explain_chat_stream(
                 yield f"Error: Unexpected API response format. {str(e)}"
             return
 
+        content_filter = _ReasoningContentFilter()
         for line in resp.iter_lines():
             if not line:
                 continue
@@ -297,15 +505,21 @@ def explain_chat_stream(
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
-                content = delta.get("content", "")
-                # DeepSeek-R1 uses reasoning_content for thinking process
-                if not content:
-                    content = delta.get("reasoning_content", "")
+                content = _message_content(delta)
+                # reasoning_content/reasoning is intentionally ignored. It is
+                # the model's internal trace, not the assistant answer.
                 if content:
-                    yield content
+                    if content_filter is not None:
+                        content = content_filter.feed(content)
+                    if content:
+                        yield content
             except Exception as e:
                 _logger.debug(f"[API] SSE parse error on line: {line_str[:80]}... error: {e}")
                 continue
+        if content_filter is not None:
+            remaining = content_filter.finish()
+            if remaining:
+                yield remaining
 
     except requests.exceptions.RequestException as e:
         yield f"Error: API request failed. {str(e)}"

@@ -83,46 +83,14 @@ class ExplainQueryWorker(QThread):
     chunk_ready = QSignal(str)
     result_ready = QSignal(str)
 
-    def __init__(self, messages: list, provider: dict, timer_data: dict | None = None, thinking_mode: str = "none"):
+    def __init__(self, messages: list, provider: dict, timer_data: dict | None = None):
         super().__init__()
         self.messages = messages
         self.provider = provider
         self.streaming = bool(provider.get("streaming", True))
         self.timer_data = timer_data or {}
-        self.thinking_mode = thinking_mode  # "none" or "answer_marker"
         self._first_chunk_emitted = False
         self.cancelled = False
-        self._answer_started = False
-        self._pending_buffer = ""
-
-    def _filter_answer_marker_chunk(self, chunk: str) -> str:
-        """Only emit content after triple <ANSWER_START><ANSWER_START><ANSWER_START> marker."""
-        if self._answer_started:
-            # Already started; emit everything
-            return chunk
-
-        self._pending_buffer += chunk
-        marker = "<ANSWER_START><ANSWER_START><ANSWER_START>"
-        idx = self._pending_buffer.find(marker)
-
-        if idx == -1:
-            # Triple marker not found yet; emit nothing, keep buffering
-            return ""
-
-        # Triple marker found; emit everything after it
-        self._answer_started = True
-        result = self._pending_buffer[idx + len(marker):]
-        self._pending_buffer = ""
-        return result.lstrip()
-
-    @staticmethod
-    def _strip_answer_marker(text: str) -> str:
-        """Remove everything before and including the triple marker."""
-        marker = "<ANSWER_START><ANSWER_START><ANSWER_START>"
-        idx = text.find(marker)
-        if idx == -1:
-            return text
-        return text[idx + len(marker):].lstrip()
 
     def run(self):
         import time
@@ -145,8 +113,6 @@ class ExplainQueryWorker(QThread):
                     if chunk.startswith("Error:"):
                         self.result_ready.emit(chunk)
                         return
-                    if self.thinking_mode == "answer_marker":
-                        chunk = self._filter_answer_marker_chunk(chunk)
                     if chunk:
                         full_text += chunk
                         self.chunk_ready.emit(chunk)
@@ -167,9 +133,8 @@ class ExplainQueryWorker(QThread):
                 if result.startswith("Error:"):
                     self.result_ready.emit(result)
                     return
-                if self.thinking_mode == "answer_marker":
-                    result = self._strip_answer_marker(result)
-                self.chunk_ready.emit(result)
+                if result:
+                    self.chunk_ready.emit(result)
                 self.result_ready.emit(result)
         except Exception as e:
             self.result_ready.emit(f"Error: {str(e)}")
@@ -378,22 +343,14 @@ class MainWindow(QMainWindow):
     #  Helpers
     # ------------------------------------------------------------------ #
 
-    def _get_thinking_mode(self) -> str:
-        """Return the configured thinking mode: 'none' or 'answer_marker'."""
-        return database.get_setting("thinking_mode", "none")
-
     def _build_explain_system(self, prompt_key: str) -> str:
-        """Build system prompt with mandatory marker instruction for answer_marker mode."""
+        """Build a final-answer-only system prompt for Explain Mode."""
         base = prompt_manager.get_prompt(prompt_key).get("system", "")
-        if self._get_thinking_mode() == "answer_marker":
-            base += (
-                " IMPORTANT: A filter program is monitoring your output. To prevent false triggers, "
-                "you must NEVER write the sequence <ANSWER_START> during your reasoning or planning. "
-                "Only when you are completely certain that the very next text will be your final answer, "
-                "output <ANSWER_START> three times consecutively with no spaces, then immediately write "
-                "your answer. If you write this marker prematurely, the filter will cut off your actual answer "
-                "and the user will see nothing. Be absolutely sure before you emit it."
-            )
+        base += (
+            " Return only the final answer intended for the user. Do not expose "
+            "chain-of-thought, hidden reasoning, analysis, scratch work, or "
+            "<think>/<analysis> sections. Do not emit internal control markers."
+        )
         return base
 
     def _current_tab(self) -> PdfTabWidget | None:
@@ -1004,7 +961,7 @@ class MainWindow(QMainWindow):
             popup.set_thinking(False)
             return
 
-        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, thinking_mode=self._get_thinking_mode())
+        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider)
         tab._explain_worker = worker
 
         def on_chunk(chunk):
@@ -1062,7 +1019,7 @@ class MainWindow(QMainWindow):
             popup.append_text("[Error] No AI provider configured.")
             popup.set_thinking(False)
             return
-        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, thinking_mode=self._get_thinking_mode())
+        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider)
         tab._explain_worker = worker
 
         def on_chunk(chunk):
@@ -1342,7 +1299,7 @@ class MainWindow(QMainWindow):
             return
 
         timer["before_worker"] = time.perf_counter()
-        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, timer_data=timer, thinking_mode=self._get_thinking_mode())
+        worker = ExplainQueryWorker(tab.explain_messages.copy(), provider, timer_data=timer)
         tab._explain_worker = worker
 
         def on_chunk(chunk):
