@@ -1,0 +1,30 @@
+请阅读我上传的 PPT（或由 PPT 导出的 PDF），提取适合做阅读导航的目录结构，并严格只输出一个合法的 JSON 对象。
+
+不要输出 Markdown 代码块，不要输出解释文字，不要输出注释。不要填写本地文件路径、文件名、数据库 id 或任何 Knowledge Manager 无法知道的字段。页码使用 PPT/PDF 中人看到的页码，从 1 开始。
+
+必须使用下面的格式：
+{
+  "format": "knowledge-manager-bookmarks",
+  "version": 1,
+  "page_number_base": 1,
+  "bookmarks": [
+    {
+      "title": "章节标题",
+      "page": 1,
+      "children": [
+        {
+          "title": "小节标题",
+          "page": 3,
+          "children": []
+        }
+      ]
+    }
+  ]
+}
+
+规则：
+1. 每个节点都必须有 title、page、children。page 必须是整数，表示该节点开始的幻灯片页码；不能确定时使用最接近的实际页码，不要编造超出文件页数的页码。
+2. 目录层级最多保留 3 层，标题简洁明确，去掉“目录”“谢谢观看”等没有导航价值的项目。
+3. 按幻灯片出现顺序输出，children 也按顺序输出。
+4. 没有合适的子节点时使用空数组 []。
+5. 最终响应必须是可直接保存为 .json 文件的纯 JSON。

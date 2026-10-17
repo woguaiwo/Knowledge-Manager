@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('design/bookmark_ai_prompt.txt', 'design')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

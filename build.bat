@@ -44,6 +44,10 @@ if exist "%BACKUP_DIR%\vocab" (
     xcopy /E /I /Y "%BACKUP_DIR%\vocab" "%DIST_DIR%\vocab" >nul
     echo [Restore] vocab/ restored
 )
+if exist "design\bookmark_ai_prompt.txt" (
+    copy /Y "design\bookmark_ai_prompt.txt" "%DIST_DIR%\bookmark_ai_prompt.txt" >nul
+    echo [Build] bookmark_ai_prompt.txt copied
+)
 
 echo =========================================
 echo  Build Complete: %DIST_DIR%

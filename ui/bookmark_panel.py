@@ -3,9 +3,10 @@ Bookmark panel with tree structure, drag-and-drop reordering, and import/export.
 """
 import json
 import os
+import re
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray
+from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray, QEvent
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QPushButton, QLabel, QInputDialog, QMessageBox, QFileDialog,
@@ -223,6 +224,13 @@ class BookmarkTreeWidget(QTreeWidget):
 class BookmarkPanel(QWidget):
     """Left panel for managing PDF bookmarks."""
 
+    # Aliases accepted from AI-generated JSON. Exported files continue to use
+    # the canonical ``bookmarks`` / ``page_number`` fields.
+    _ITEM_LIST_KEYS = ("bookmarks", "items", "outline", "chapters", "sections", "entries", "slides")
+    _TITLE_KEYS = ("title", "name", "label", "heading", "text")
+    _PAGE_KEYS = ("page_number", "page", "slide_number", "slide", "page_no", "slide_no")
+    _CHILDREN_KEYS = ("children", "bookmarks", "items", "subsections", "subtopics", "sections")
+
     bookmark_clicked = Signal(int)
     add_current_page_requested = Signal()
     structure_changed = Signal()
@@ -250,6 +258,9 @@ class BookmarkPanel(QWidget):
         self.tree = BookmarkTreeWidget()
         self.tree.bookmark_clicked.connect(self.bookmark_clicked.emit)
         self.tree.structure_changed.connect(self.structure_changed.emit)
+        # External JSON drops should be handled by the importer while the
+        # tree keeps its internal drag-and-drop reordering.
+        self.tree.viewport().installEventFilter(self)
         layout.addWidget(self.tree)
 
         # Export / Import buttons
@@ -257,13 +268,56 @@ class BookmarkPanel(QWidget):
         self.btn_export = QPushButton("📤 Export")
         self.btn_export.clicked.connect(self._on_export)
         self.btn_import = QPushButton("📥 Import")
-        self.btn_import.clicked.connect(self._on_import)
+        self.btn_import.clicked.connect(lambda: self._on_import())
         btn_layout.addWidget(self.btn_export)
         btn_layout.addWidget(self.btn_import)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
         layout.addStretch()
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def _json_drop_paths(mime_data) -> List[str]:
+        """Return local JSON paths from a drag/drop mime payload."""
+        if not mime_data or not mime_data.hasUrls():
+            return []
+        paths = []
+        for url in mime_data.urls():
+            if url.isLocalFile():
+                path = url.toLocalFile()
+                if path.lower().endswith(".json"):
+                    paths.append(path)
+        return paths
+
+    def dragEnterEvent(self, event):
+        if self._json_drop_paths(event.mimeData()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = self._json_drop_paths(event.mimeData())
+        if paths:
+            event.acceptProposedAction()
+            self._import_from_path(paths[0])
+            return
+        super().dropEvent(event)
+
+    def eventFilter(self, watched, event):
+        """Intercept external JSON drops over the tree viewport."""
+        if watched is self.tree.viewport():
+            if event.type() == QEvent.Type.DragEnter:
+                if self._json_drop_paths(event.mimeData()):
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QEvent.Type.Drop:
+                paths = self._json_drop_paths(event.mimeData())
+                if paths:
+                    event.acceptProposedAction()
+                    self._import_from_path(paths[0])
+                    return True
+        return super().eventFilter(watched, event)
 
     def set_pdf(self, pdf_path: str):
         """Set the current PDF and reload bookmarks."""
@@ -321,6 +375,12 @@ class BookmarkPanel(QWidget):
 
         tree_data = _build_tree(0)
         export_data = {
+            "format": "knowledge-manager-bookmarks",
+            "version": 1,
+            # Database page_number values are zero-based. Keeping this explicit
+            # makes exported files unambiguous and gives AI output a clear
+            # counterpart (page_number_base: 1).
+            "page_number_base": 0,
             "pdf_path": self._current_pdf,
             "exported_at": __import__("datetime").datetime.now().isoformat(),
             "bookmarks": tree_data
@@ -333,49 +393,209 @@ class BookmarkPanel(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export:\n{e}")
 
-    def _on_import(self):
-        """Import bookmarks from a JSON file."""
+    @staticmethod
+    def _strip_json_code_fence(text: str) -> str:
+        """Remove a Markdown JSON fence commonly added by chat models."""
+        text = text.lstrip("\ufeff").strip()
+        if not text.startswith("```"):
+            return text
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    @classmethod
+    def _page_base(cls, data: Dict) -> tuple[int, bool]:
+        """Read an explicit page numbering base from document metadata."""
+        value = data.get("page_number_base", data.get("page_base"))
+        if value is None:
+            value = data.get("numbering")
+        if isinstance(value, str):
+            normalized = value.strip().lower().replace("_", "-")
+            if normalized in {"1", "1-based", "one-based", "one"}:
+                return 1, True
+            if normalized in {"0", "0-based", "zero-based", "zero"}:
+                return 0, True
+        elif value in (0, 1):
+            return int(value), True
+        return 0, False
+
+    @staticmethod
+    def _coerce_page(value, default: int) -> int:
+        """Convert an AI-produced page/slide value into an integer."""
+        if value is None or isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        text = str(value).strip()
+        try:
+            return int(text)
+        except ValueError:
+            # Also accept values such as "Slide 12" or "第12页".
+            match = re.search(r"\d+", text)
+            return int(match.group()) if match else default
+
+    @classmethod
+    def _extract_import_items(cls, data):
+        """Extract the item list from supported AI/export root shapes."""
+        if isinstance(data, list):
+            return data, {}, False
+        if not isinstance(data, dict):
+            raise ValueError("JSON root must be an object or an array.")
+
+        for key in cls._ITEM_LIST_KEYS:
+            value = data.get(key)
+            if isinstance(value, list):
+                return value, data, True
+
+        # A single bookmark object is convenient for small AI outputs.
+        if any(key in data for key in cls._TITLE_KEYS) or "children" in data:
+            return [data], data, True
+        keys = ", ".join(cls._ITEM_LIST_KEYS)
+        raise ValueError(f"No bookmark list found. Expected one of: {keys}.")
+
+    @classmethod
+    def _normalize_import_items(cls, items, metadata):
+        """Normalize common AI fields to the database representation."""
+        page_base, explicit_base = cls._page_base(metadata)
+        warnings = []
+        normalized_count = 0
+
+        def normalize(node, path: str):
+            nonlocal normalized_count
+            if not isinstance(node, dict):
+                warnings.append(f"{path}: item is not an object and was skipped")
+                return None
+
+            title = ""
+            for key in cls._TITLE_KEYS:
+                if node.get(key) is not None:
+                    title = str(node[key]).strip()
+                    if title:
+                        break
+            if not title:
+                title = "Untitled"
+                warnings.append(f"{path}: missing title, using 'Untitled'")
+
+            page_key = next((key for key in cls._PAGE_KEYS if key in node), None)
+            raw_page = node.get(page_key) if page_key else 0
+            # "page" and "slide" are natural-language fields and are treated
+            # as one-based when no explicit metadata says otherwise. The
+            # exported page_number field keeps its historical zero-based rule.
+            item_base = page_base
+            if not explicit_base and page_key in {"page", "slide_number", "slide", "page_no", "slide_no"}:
+                item_base = 1
+            page = cls._coerce_page(raw_page, 0)
+            page = max(0, page - item_base)
+
+            entry_type = str(node.get("entry_type", node.get("type", "bookmark"))).strip().lower()
+            if entry_type not in {"bookmark", "keyword"}:
+                warnings.append(f"{path}: unknown entry_type '{entry_type}', using 'bookmark'")
+                entry_type = "bookmark"
+
+            children = []
+            child_key = next(
+                (key for key in cls._CHILDREN_KEYS if isinstance(node.get(key), (list, dict))),
+                None,
+            )
+            if child_key:
+                raw_children = node[child_key]
+                if isinstance(raw_children, dict):
+                    raw_children = [raw_children]
+                for index, child in enumerate(raw_children):
+                    normalized_child = normalize(child, f"{path}.children[{index}]")
+                    if normalized_child is not None:
+                        children.append(normalized_child)
+
+            normalized_count += 1
+            return {
+                "title": title,
+                "page_number": page,
+                "entry_type": entry_type,
+                "children": children,
+            }
+
+        result = []
+        for index, item in enumerate(items):
+            normalized = normalize(item, f"bookmarks[{index}]")
+            if normalized is not None:
+                result.append(normalized)
+        return result, warnings, normalized_count
+
+    def _read_import_file(self, path: str):
+        """Read and normalize an exported or AI-generated JSON file."""
+        with open(path, "r", encoding="utf-8-sig") as f:
+            raw_text = self._strip_json_code_fence(f.read())
+        data = json.loads(raw_text)
+        items, metadata, _ = self._extract_import_items(data)
+        normalized, warnings, count = self._normalize_import_items(items, metadata)
+        if not normalized:
+            raise ValueError("The JSON file contains no usable bookmarks.")
+        return normalized, warnings, count
+
+    def _import_from_path(self, path: str):
+        """Import one JSON file, replacing the current PDF's bookmark tree."""
         if not self._current_pdf:
             QMessageBox.warning(self, "No PDF", "Please open a PDF first.")
-            return
-
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import Bookmarks", "", "JSON Files (*.json)"
-        )
-        if not path:
-            return
+            return False
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            bookmarks, warnings, count = self._read_import_file(path)
         except Exception as e:
-            QMessageBox.critical(self, "Import Error", f"Failed to read file:\n{e}")
-            return
+            QMessageBox.critical(self, "Import Error", f"Failed to read bookmark JSON:\n{e}")
+            return False
 
-        bookmarks = data.get("bookmarks", [])
-        if not isinstance(bookmarks, list):
-            QMessageBox.critical(self, "Import Error", "Invalid bookmark file format.")
-            return
-
-        # Clear existing bookmarks
+        # Never erase an existing outline without an explicit confirmation.
         existing = database.get_bookmarks(self._current_pdf)
+        if existing:
+            reply = QMessageBox.question(
+                self,
+                "Replace Bookmarks",
+                f"This PDF already has {len(existing)} bookmark entries.\n"
+                "Replace them with the imported outline?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+
         for bm in existing:
             database.delete_bookmark(bm["id"])
 
-        # Import recursively
         def _import_tree(items: List[Dict], parent_id: int = 0):
             for item in items:
-                title = item.get("title", "Untitled")
-                page = item.get("page_number", 0)
-                entry_type = item.get("entry_type", "bookmark")
                 new_id = database.add_bookmark(
-                    self._current_pdf, page, title, parent_id, entry_type
+                    self._current_pdf,
+                    item["page_number"],
+                    item["title"],
+                    parent_id,
+                    item["entry_type"],
                 )
-                children = item.get("children", [])
-                if children:
-                    _import_tree(children, new_id)
+                if item["children"]:
+                    _import_tree(item["children"], new_id)
 
         _import_tree(bookmarks)
         self.tree.set_pdf(self._current_pdf)
         self.structure_changed.emit()
-        QMessageBox.information(self, "Import", "Bookmarks imported successfully.")
+        message = f"Imported {count} bookmark entries successfully."
+        if warnings:
+            message += "\n\nWarnings:\n" + "\n".join(f"• {warning}" for warning in warnings[:8])
+            if len(warnings) > 8:
+                message += f"\n• ...and {len(warnings) - 8} more"
+        QMessageBox.information(self, "Import", message)
+        return True
+
+    def _on_import(self):
+        """Choose and import a bookmark JSON file."""
+        if not self._current_pdf:
+            QMessageBox.warning(self, "No PDF", "Please open a PDF first.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Bookmarks", "", "JSON Files (*.json)"
+        )
+        if path:
+            self._import_from_path(path)
