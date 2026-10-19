@@ -35,6 +35,10 @@ class ExplainPopup(QWidget):
         self._streaming = False
         self._stream_buffer = ""
         self.is_pinned = False
+        # The page location that should receive an annotation when Save is clicked.
+        self.annotation_page_number = None
+        self.annotation_global_pos = None
+        self.saved_annotation_id = None
 
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)

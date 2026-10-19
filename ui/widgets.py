@@ -2,8 +2,9 @@
 Custom widgets for PDF page rendering and word-level interaction.
 """
 import random
+import re
 from PySide6.QtCore import Qt, Signal, QRect, QPoint
-from PySide6.QtGui import QColor, QPainter, QPixmap, QPen
+from PySide6.QtGui import QColor, QPainter, QPixmap, QPen, QTextDocument
 from PySide6.QtWidgets import (
     QWidget, QLabel, QSizePolicy, QApplication
 )
@@ -37,18 +38,61 @@ _HOVER_LABEL_MAX_WIDTH = 270
 _HOVER_LABEL_MARGIN = 8
 
 
-def _prepare_hover_label(label: QLabel, text: str):
-    """Size a hover label so long notes wrap inside a readable box."""
+def _looks_like_markdown(text: str) -> bool:
+    """Detect clear Markdown markers without classifying ordinary prose as rich text."""
+    if not text or not text.strip():
+        return False
+
+    lines = text.splitlines()
+    marker_patterns = (
+        r"^\s{0,3}#{1,6}\s+\S+",       # headings
+        r"^\s*[-*+]\s+\S+",            # unordered lists
+        r"^\s*\d+[.)]\s+\S+",         # ordered lists
+        r"^\s*>\s+\S+",                # block quotes
+        r"^\s*```",                     # fenced code
+        r"^\s*\|.+\|\s*$",             # tables
+    )
+    if any(re.search(pattern, line) for line in lines for pattern in marker_patterns):
+        return True
+
+    inline_patterns = (
+        r"\[[^\]]+\]\([^\)]+\)",       # links
+        r"`[^`\n]+`",                     # inline code
+        r"(?:\*\*|__)[^\n]+?(?:\*\*|__)",  # bold
+        r"(?<!\*)\*[^*\n]+\*(?!\*)",  # italic
+    )
+    return any(re.search(pattern, text) for pattern in inline_patterns)
+
+
+def _render_hover_text(text: str, note_format: str = "auto") -> tuple[str, Qt.TextFormat]:
+    """Return label text and its Qt format, rendering Markdown only when needed."""
+    format_name = (note_format or "auto").strip().lower()
+    use_markdown = format_name == "markdown" or (
+        format_name not in {"plain", "text"} and _looks_like_markdown(text)
+    )
+    if not use_markdown:
+        return text, Qt.TextFormat.PlainText
+
+    document = QTextDocument()
+    document.setMarkdown(text)
+    return document.toHtml(), Qt.TextFormat.RichText
+
+
+def _prepare_hover_label(label: QLabel, text: str, note_format: str = "auto"):
+    """Size a hover label and render Markdown notes as rich text."""
     parent = label.parentWidget()
     available_width = parent.width() - (_HOVER_LABEL_MARGIN * 2) if parent else 0
     max_width = _HOVER_LABEL_MAX_WIDTH
     if available_width > 0:
         max_width = min(max_width, available_width)
 
+    rendered_text, text_format = _render_hover_text(text, note_format)
     label.setWordWrap(True)
     label.setMinimumWidth(0)
     label.setMaximumWidth(max_width)
-    label.setText(text)
+    label.setTextFormat(text_format)
+    label.setText(rendered_text)
+    label.setOpenExternalLinks(False)
 
     # Keep short notes compact while capping long notes at max_width.
     longest_line = max(
@@ -319,10 +363,11 @@ class AnnotationIconWidget(QWidget):
     drag_moved = Signal(object)                 # global QPoint
     drag_finished = Signal(object)              # global QPoint
 
-    def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", unzoomed_pos: tuple = None, parent=None):
+    def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", note_format: str = "auto", unzoomed_pos: tuple = None, parent=None):
         super().__init__(parent)
         self.annotation_id = annotation_id
         self.note_text = note_text
+        self.note_format = note_format or "auto"
         self.unzoomed_pos = unzoomed_pos or (x, y)  # (x, y) in PDF coordinates
         self.setGeometry(int(x), int(y), int(width), int(height))
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
@@ -439,7 +484,7 @@ class AnnotationIconWidget(QWidget):
             self._hover_label.setStyleSheet(_get_hover_label_style())
             self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         display = self.note_text if self.note_text else "(Double-click to add note)"
-        _prepare_hover_label(self._hover_label, display)
+        _prepare_hover_label(self._hover_label, display, self.note_format)
         _position_hover_label(self, self._hover_label, QPoint(28, 0))
         self._hover_label.show()
         self._hover_label.raise_()
@@ -474,6 +519,7 @@ class HighlightWidget(QWidget):
         # Store unzoomed bbox for fast geometry updates on rescale
         self.unzoomed_rect = unzoomed_rect  # (x, y, width, height) in PDF coordinates
         self.annotation_text = ""  # attached annotation note
+        self.annotation_format = "auto"
         self.setGeometry(int(x), int(y), int(width) + 1, int(height) + 1)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -557,7 +603,7 @@ class HighlightWidget(QWidget):
                 self._hover_label = QLabel(self.parentWidget())
                 self._hover_label.setStyleSheet(_get_hover_label_style())
                 self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            _prepare_hover_label(self._hover_label, self.annotation_text)
+            _prepare_hover_label(self._hover_label, self.annotation_text, self.annotation_format)
             _position_hover_label(self, self._hover_label, QPoint(10, -30))
             self._hover_label.show()
             self._hover_label.raise_()
@@ -578,9 +624,10 @@ class HighlightWidget(QWidget):
             _position_hover_label(self, self._hover_label, QPoint(10, -30))
         super().mouseMoveEvent(event)
 
-    def set_annotation_text(self, text: str):
+    def set_annotation_text(self, text: str, note_format: str = "auto"):
         """Set attached annotation text and update visual indicator."""
         self.annotation_text = text
+        self.annotation_format = note_format or "auto"
         self.update()
 
     def paintEvent(self, event):
@@ -801,19 +848,20 @@ class PageView(QWidget):
             self.engine.path, self.page_number,
             pdf_x, pdf_y, "", "icon", 0, 24, 24
         )
-        self._create_annotation_widget(annot_id, pdf_x, pdf_y, "")
+        self._create_annotation_widget(annot_id, pdf_x, pdf_y, "", "auto")
         # Exit annotation mode after placing
         self.annotation_mode = False
         self.unsetCursor()
         # Notify main window to auto-open editor
         self.annotation_placed.emit(annot_id, QCursor.pos())
 
-    def _create_annotation_widget(self, annot_id: int, pdf_x: float, pdf_y: float, note_text: str):
+    def _create_annotation_widget(self, annot_id: int, pdf_x: float, pdf_y: float,
+                                  note_text: str, note_format: str = "auto"):
         """Create an AnnotationIconWidget from PDF coordinates."""
         widget = AnnotationIconWidget(
             annot_id,
             pdf_x * self.zoom, pdf_y * self.zoom,
-            24, 24, note_text,
+            24, 24, note_text, note_format,
             unzoomed_pos=(pdf_x, pdf_y),
             parent=self.overlay
         )
@@ -880,7 +928,8 @@ class PageView(QWidget):
         for annot in annotations:
             if annot["target_type"] == "icon":
                 self._create_annotation_widget(
-                    annot["id"], annot["x"], annot["y"], annot["note_text"]
+                    annot["id"], annot["x"], annot["y"], annot["note_text"],
+                    annot.get("note_format", "auto")
                 )
 
     def update_annotation_geometries(self):
@@ -1436,7 +1485,9 @@ class PageView(QWidget):
             # Load annotation for this highlight if exists
             annot = database.get_annotation_for_target(self.engine.path, "highlight", h["id"])
             if annot:
-                hw.set_annotation_text(annot["note_text"])
+                hw.set_annotation_text(
+                    annot["note_text"], annot.get("note_format", "auto")
+                )
             hw.show()
             self.highlight_widgets.append(hw)
 

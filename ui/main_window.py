@@ -3,8 +3,8 @@ Main application window for Knowledge Manager.
 VSCode-style layout: Activity Bar + Sidebar + Tabbed Main Area + Right Vocab Panel.
 """
 import os
-from PySide6.QtCore import Qt, QThread, Signal as QSignal, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QIcon
+from PySide6.QtCore import Qt, QThread, Signal as QSignal, QTimer, QPoint
+from PySide6.QtGui import QAction, QKeySequence, QIcon, QCursor
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QToolBar, QLabel, QDockWidget,
     QMessageBox, QApplication, QDialog, QWidget, QHBoxLayout,
@@ -938,6 +938,7 @@ class MainWindow(QMainWindow):
             self._explain_popup = None
 
         popup = ExplainPopup(current_word=selected_text, parent=self)
+        self._set_explain_annotation_anchor(popup, tab, global_pos=global_pos)
         popup.set_thinking(True)
         popup.show_near_cursor()
 
@@ -984,7 +985,9 @@ class MainWindow(QMainWindow):
 
         self._explain_popup = popup
         popup.follow_up_requested.connect(lambda text: self._on_explain_follow_up(text, tab, popup))
-        popup.save_requested.connect(lambda word, resp: self._on_explain_save(word, resp, tab))
+        popup.save_requested.connect(
+            lambda word, resp, p=popup: self._on_explain_save(word, resp, tab, p)
+        )
         popup.closed.connect(self._on_explain_popup_closed)
 
     def _on_explain_result(self, result: str, tab, popup):
@@ -1092,7 +1095,9 @@ class MainWindow(QMainWindow):
             image_mime=mime,
             display_title="[Image]",
             timer_data=timer,
-            prompt_key="prompt_explain_image"
+            prompt_key="prompt_explain_image",
+            annotation_page_number=page_number,
+            annotation_global_pos=QCursor.pos(),
         )
 
     def _on_page_double_clicked(self, page_number: int):
@@ -1134,7 +1139,9 @@ class MainWindow(QMainWindow):
             image_mime=mime,
             display_title="[Page]",
             timer_data=timer,
-            prompt_key="prompt_explain_page"
+            prompt_key="prompt_explain_page",
+            annotation_page_number=page_number,
+            annotation_global_pos=QCursor.pos(),
         )
 
     def _on_link_clicked(self, link_data: dict):
@@ -1193,19 +1200,22 @@ class MainWindow(QMainWindow):
 
     def _do_annotation_save(self, annotation_id: int, text: str):
         """Save annotation text to database and update UI."""
-        database.update_annotation_text(annotation_id, text)
+        database.update_annotation_text(annotation_id, text, note_format="auto")
         tab = self._current_tab()
         if tab and tab.scroll_view:
             for pv in tab.scroll_view.page_views:
                 for aw in pv.annotation_widgets:
                     if aw.annotation_id == annotation_id:
                         aw.note_text = text
+                        aw.note_format = "auto"
+                        if aw._hover_label is not None:
+                            aw._hover_label.hide()
                 for hw in pv.highlight_widgets:
                     annot = database.get_annotation_for_target(
                         tab.pdf_path, "highlight", hw.highlight_id
                     )
                     if annot and annot["id"] == annotation_id:
-                        hw.set_annotation_text(text)
+                        hw.set_annotation_text(text, "auto")
         self.status_label.setText("Annotation saved.")
 
     def _do_annotation_delete(self, annotation_id: int):
@@ -1259,7 +1269,18 @@ class MainWindow(QMainWindow):
         """Hide annotation tooltip for highlight leave (unused, kept for compatibility)."""
         pass
 
-    def _run_explain_with_image(self, tab, text_prompt: str, image_b64: str, image_mime: str, display_title: str, timer_data: dict | None = None, prompt_key: str = "prompt_explain_image"):
+    def _run_explain_with_image(
+        self,
+        tab,
+        text_prompt: str,
+        image_b64: str,
+        image_mime: str,
+        display_title: str,
+        timer_data: dict | None = None,
+        prompt_key: str = "prompt_explain_image",
+        annotation_page_number: int | None = None,
+        annotation_global_pos: QPoint | None = None,
+    ):
         """Common logic for image-based explain queries."""
         import time
         timer = timer_data or {}
@@ -1278,6 +1299,12 @@ class MainWindow(QMainWindow):
             self._explain_popup = None
 
         popup = ExplainPopup(current_word=display_title, parent=self)
+        self._set_explain_annotation_anchor(
+            popup,
+            tab,
+            global_pos=annotation_global_pos,
+            page_number=annotation_page_number,
+        )
         popup.set_thinking(True)
         popup.show_near_cursor()
 
@@ -1323,12 +1350,121 @@ class MainWindow(QMainWindow):
 
         self._explain_popup = popup
         popup.follow_up_requested.connect(lambda text: self._on_explain_follow_up(text, tab, popup))
-        popup.save_requested.connect(lambda word, resp: self._on_explain_save(word, resp, tab))
+        popup.save_requested.connect(
+            lambda word, resp, p=popup: self._on_explain_save(word, resp, tab, p)
+        )
         popup.closed.connect(self._on_explain_popup_closed)
 
-    def _on_explain_save(self, word: str, explanation: str, tab):
+    def _set_explain_annotation_anchor(self, popup, tab, global_pos=None, page_number=None):
+        """Remember the PDF location associated with an Explain popup."""
+        popup.annotation_global_pos = QPoint(global_pos) if global_pos is not None else None
+        popup.annotation_page_number = page_number
+
+        # Selection events include the exact page location. For callers that only
+        # provide a cursor position, infer the page while it is still visible.
+        if popup.annotation_page_number is None and popup.annotation_global_pos is not None:
+            scroll_view = getattr(tab, "scroll_view", None)
+            for page_view in getattr(scroll_view, "page_views", []):
+                local_pos = page_view.mapFromGlobal(popup.annotation_global_pos)
+                if page_view.rect().contains(local_pos):
+                    popup.annotation_page_number = page_view.page_number
+                    break
+
+    @staticmethod
+    def _annotation_page_view(tab, popup):
+        """Find the page view that should receive a saved explanation."""
+        scroll_view = getattr(tab, "scroll_view", None)
+        page_views = getattr(scroll_view, "page_views", [])
+        page_number = getattr(popup, "annotation_page_number", None)
+        if page_number is not None:
+            for page_view in page_views:
+                if page_view.page_number == page_number:
+                    return page_view
+
+        global_pos = getattr(popup, "annotation_global_pos", None)
+        if global_pos is not None:
+            for page_view in page_views:
+                if page_view.rect().contains(page_view.mapFromGlobal(global_pos)):
+                    return page_view
+        return None
+
+    def _create_explain_annotation(self, tab, popup, explanation: str):
+        """Create or update the icon attached to an Explain response."""
+        page_view = self._annotation_page_view(tab, popup)
+        if page_view is None:
+            return None
+
+        existing_id = getattr(popup, "saved_annotation_id", None)
+        if existing_id is not None:
+            database.update_annotation_text(existing_id, explanation, note_format="markdown")
+            for widget in page_view.annotation_widgets:
+                if widget.annotation_id == existing_id:
+                    widget.note_text = explanation
+                    widget.note_format = "markdown"
+                    if widget._hover_label is not None:
+                        widget._hover_label.hide()
+                    break
+            return existing_id
+
+        global_pos = getattr(popup, "annotation_global_pos", None)
+        if global_pos is not None:
+            local_pos = page_view.overlay.mapFromGlobal(global_pos)
+            # Keep the 24 px icon centered on the originating selection/click.
+            local_x = local_pos.x() - 12
+            local_y = local_pos.y() - 12
+        else:
+            local_x = page_view.overlay.width() // 2 - 12
+            local_y = page_view.overlay.height() // 2 - 12
+
+        max_x = max(0, page_view.overlay.width() - 24)
+        max_y = max(0, page_view.overlay.height() - 24)
+        local_x = max(0, min(local_x, max_x))
+        local_y = max(0, min(local_y, max_y))
+        pdf_x = local_x / page_view.zoom
+        pdf_y = local_y / page_view.zoom
+        annotation_id = database.add_annotation(
+            tab.pdf_path,
+            page_view.page_number,
+            pdf_x,
+            pdf_y,
+            explanation,
+            "icon",
+            0,
+            24,
+            24,
+            note_format="markdown",
+        )
+        page_view._create_annotation_widget(
+            annotation_id,
+            pdf_x,
+            pdf_y,
+            explanation,
+            "markdown",
+        )
+        popup.saved_annotation_id = annotation_id
+        return annotation_id
+
+    def _on_explain_save(self, word: str, explanation: str, tab, popup=None):
+        """Save the response cache and attach the response to a page icon."""
+        explanation = (explanation or "").strip()
+        if not explanation:
+            self.status_label.setText("Nothing to save yet.")
+            return
+
         database.save_explanation(tab.pdf_path, word, explanation)
-        self.status_label.setText(f"Saved explanation for: {word[:40]}{'...' if len(word) > 40 else ''}")
+        annotation_id = None
+        if popup is not None:
+            annotation_id = self._create_explain_annotation(tab, popup, explanation)
+            if annotation_id is not None:
+                popup.btn_save.setText("Update")
+                popup.btn_save.setToolTip("Update this explanation annotation")
+
+        if annotation_id is not None:
+            self.status_label.setText("Explanation saved as an annotation.")
+        else:
+            self.status_label.setText(
+                f"Saved explanation for: {word[:40]}{'...' if len(word) > 40 else ''}"
+            )
 
     def _on_explain_popup_closed(self):
         tab = self._current_tab()
