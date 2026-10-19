@@ -310,6 +310,8 @@ def init_db():
                 height REAL DEFAULT 24,
                 note_text TEXT DEFAULT '',
                 note_format TEXT DEFAULT 'auto',
+                hover_width INTEGER,
+                hover_height INTEGER,
                 target_type TEXT DEFAULT 'icon',
                 target_id INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL
@@ -320,6 +322,14 @@ def init_db():
         annotation_cols = [row['name'] for row in cursor.fetchall()]
         if 'note_format' not in annotation_cols:
             conn.execute("ALTER TABLE annotations ADD COLUMN note_format TEXT DEFAULT 'auto'")
+        # Hover dimensions are intentionally nullable.  A NULL pair means
+        # that the annotation still uses the original content-driven sizing
+        # rule; dimensions are written only after that individual viewer is
+        # manually resized.
+        if 'hover_width' not in annotation_cols:
+            conn.execute("ALTER TABLE annotations ADD COLUMN hover_width INTEGER")
+        if 'hover_height' not in annotation_cols:
+            conn.execute("ALTER TABLE annotations ADD COLUMN hover_height INTEGER")
         conn.commit()
 
 
@@ -348,15 +358,17 @@ def _normalize_annotation_format(note_format: str | None) -> str:
 def add_annotation(pdf_path: str, page_number: int, x: float, y: float,
                    note_text: str = "", target_type: str = "icon",
                    target_id: int = 0, width: float = 24, height: float = 24,
-                   note_format: str = "auto") -> int:
+                   note_format: str = "auto", hover_width: int = None,
+                   hover_height: int = None) -> int:
     """Add an annotation and return its id."""
     with _get_conn() as conn:
         canonical = _get_canonical_pdf_path_annot(conn, pdf_path)
         cursor = conn.execute(
-            "INSERT INTO annotations (pdf_path, page_number, x, y, width, height, note_text, note_format, target_type, target_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO annotations (pdf_path, page_number, x, y, width, height, note_text, note_format, hover_width, hover_height, target_type, target_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (canonical, page_number, x, y, width, height, note_text,
-             _normalize_annotation_format(note_format), target_type, target_id,
+             _normalize_annotation_format(note_format), hover_width, hover_height,
+             target_type, target_id,
              datetime.now().isoformat())
         )
         conn.commit()
@@ -369,14 +381,14 @@ def get_annotations(pdf_path: str, page_number: int = None) -> List[Dict]:
     with _get_conn() as conn:
         if page_number is not None:
             rows = conn.execute(
-                "SELECT id, pdf_path, page_number, x, y, width, height, note_text, note_format, target_type, target_id, created_at "
+                "SELECT id, pdf_path, page_number, x, y, width, height, note_text, note_format, hover_width, hover_height, target_type, target_id, created_at "
                 "FROM annotations WHERE (pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ?) AND page_number = ? "
                 "ORDER BY created_at",
                 (pdf_path, normalized, page_number)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, pdf_path, page_number, x, y, width, height, note_text, note_format, target_type, target_id, created_at "
+                "SELECT id, pdf_path, page_number, x, y, width, height, note_text, note_format, hover_width, hover_height, target_type, target_id, created_at "
                 "FROM annotations WHERE pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ? ORDER BY page_number, created_at",
                 (pdf_path, normalized)
             ).fetchall()
@@ -415,6 +427,27 @@ def update_annotation_position(annotation_id: int, x: float, y: float, page_numb
         conn.commit()
 
 
+def update_annotation_hover_size(annotation_id: int, width: int, height: int):
+    """Persist the manually chosen hover size for one annotation.
+
+    This is deliberately a separate update from icon geometry: ``width`` and
+    ``height`` on the annotation row describe the icon itself, while these
+    columns describe its optional hover viewer.  Keeping the operation small
+    means a resize writes one indexed row and does not affect rendering.
+    """
+    try:
+        width = max(1, int(width))
+        height = max(1, int(height))
+    except (TypeError, ValueError):
+        return
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE annotations SET hover_width = ?, hover_height = ? WHERE id = ?",
+            (width, height, annotation_id),
+        )
+        conn.commit()
+
+
 def delete_annotation(annotation_id: int):
     """Delete an annotation by id."""
     with _get_conn() as conn:
@@ -427,7 +460,7 @@ def get_annotation_for_target(pdf_path: str, target_type: str, target_id: int) -
     normalized = pdf_path.replace('\\', '/')
     with _get_conn() as conn:
         row = conn.execute(
-            "SELECT id, pdf_path, page_number, x, y, width, height, note_text, note_format, target_type, target_id, created_at "
+            "SELECT id, pdf_path, page_number, x, y, width, height, note_text, note_format, hover_width, hover_height, target_type, target_id, created_at "
             "FROM annotations WHERE (pdf_path = ? OR REPLACE(pdf_path, '\\', '/') = ?) AND target_type = ? AND target_id = ?",
             (pdf_path, normalized, target_type, target_id)
         ).fetchone()

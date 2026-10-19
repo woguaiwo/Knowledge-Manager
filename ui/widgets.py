@@ -4,7 +4,6 @@ Custom widgets for PDF page rendering and word-level interaction.
 import random
 import re
 import math
-import json
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QEvent
 from PySide6.QtGui import QColor, QPainter, QPixmap, QPen, QTextDocument
 from PySide6.QtWidgets import (
@@ -93,32 +92,23 @@ def _render_hover_text(text: str, note_format: str = "auto") -> tuple[str, Qt.Te
     return document.toHtml(), Qt.TextFormat.RichText
 
 
-def _load_hover_size() -> QSize | None:
-    """Read the user's preferred hover size, if one has been saved."""
+def _normalize_hover_size(value) -> QSize | None:
+    """Convert persisted hover dimensions to a valid QSize, if present."""
+    if value is None:
+        return None
     try:
-        from core import database
-        raw = database.get_setting("annotation_hover_size", "")
-        if raw:
-            data = json.loads(raw)
-            width = int(data.get("width", 0))
-            height = int(data.get("height", 0))
-            if width > 0 and height > 0:
-                return QSize(width, height)
-    except (ValueError, TypeError, json.JSONDecodeError):
+        if isinstance(value, QSize):
+            width, height = value.width(), value.height()
+        elif isinstance(value, dict):
+            width, height = value.get("width"), value.get("height")
+        else:
+            width, height = value[0], value[1]
+        width, height = int(width), int(height)
+        if width > 0 and height > 0:
+            return QSize(width, height)
+    except (TypeError, ValueError, IndexError, KeyError):
         pass
     return None
-
-
-def _save_hover_size(width: int, height: int):
-    """Persist a user-resized hover window for future annotations."""
-    try:
-        from core import database
-        database.save_setting(
-            "annotation_hover_size",
-            json.dumps({"width": int(width), "height": int(height)}),
-        )
-    except Exception as exc:
-        logger.debug("Could not persist annotation hover size: %s", exc)
 
 
 class HoverTextBrowser(QTextBrowser):
@@ -419,9 +409,17 @@ class _HoverResizeGrip(QWidget):
         painter.end()
 
 
-def _create_hover_browser(parent: QWidget) -> HoverTextBrowser:
-    """Create a bounded, scrollable hover viewer."""
+def _create_hover_browser(parent: QWidget, annotation_id: int | None = None,
+                         hover_size=None, on_resize=None) -> HoverTextBrowser:
+    """Create a bounded, scrollable hover viewer.
+
+    ``hover_size`` belongs to the annotation that owns this browser.  It is
+    deliberately kept on the widget instance, rather than in a global
+    setting, so each annotation can retain a different manually chosen size.
+    """
     browser = HoverTextBrowser(parent)
+    browser._saved_hover_size = _normalize_hover_size(hover_size)
+    browser._annotation_id = annotation_id
     browser.setReadOnly(True)
     browser.setUndoRedoEnabled(False)
     browser.setFrameShape(QFrame.Shape.NoFrame)
@@ -433,7 +431,16 @@ def _create_hover_browser(parent: QWidget) -> HoverTextBrowser:
     browser.setFocusPolicy(Qt.FocusPolicy.NoFocus)
     browser.document().setDocumentMargin(0)
     browser.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-    browser.resize_finished.connect(_save_hover_size)
+    if on_resize is not None:
+        browser.resize_finished.connect(on_resize)
+    elif annotation_id is not None:
+        def _persist_size(width, height, annot_id=annotation_id):
+            try:
+                from core import database
+                database.update_annotation_hover_size(annot_id, width, height)
+            except Exception as exc:
+                logger.debug("Could not persist annotation hover size: %s", exc)
+        browser.resize_finished.connect(_persist_size)
     return browser
 
 
@@ -459,7 +466,7 @@ def _prepare_hover_label(label: QWidget, text: str, note_format: str = "auto"):
             label.setHtml(rendered_text)
         else:
             label.setPlainText(text)
-        saved_size = _load_hover_size()
+        saved_size = getattr(label, "_saved_hover_size", None)
         if getattr(label, "_user_resized", False):
             width = label.width()
             requested_height = label.height()
@@ -764,11 +771,12 @@ class AnnotationIconWidget(QWidget):
     drag_moved = Signal(object)                 # global QPoint
     drag_finished = Signal(object)              # global QPoint
 
-    def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", note_format: str = "auto", unzoomed_pos: tuple = None, parent=None):
+    def __init__(self, annotation_id: int, x: float, y: float, width: float = 24, height: float = 24, note_text: str = "", note_format: str = "auto", unzoomed_pos: tuple = None, parent=None, hover_size=None):
         super().__init__(parent)
         self.annotation_id = annotation_id
         self.note_text = note_text
         self.note_format = note_format or "auto"
+        self.hover_size = _normalize_hover_size(hover_size)
         self.unzoomed_pos = unzoomed_pos or (x, y)  # (x, y) in PDF coordinates
         self.setGeometry(int(x), int(y), int(width), int(height))
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
@@ -884,9 +892,25 @@ class AnnotationIconWidget(QWidget):
 
     def _ensure_hover_label(self):
         if self._hover_label is None:
-            self._hover_label = _create_hover_browser(self.parentWidget())
+            self._hover_label = _create_hover_browser(
+                self.parentWidget(),
+                annotation_id=self.annotation_id,
+                hover_size=self.hover_size,
+                on_resize=self._on_hover_resize,
+            )
             self._hover_label.setStyleSheet(_get_hover_label_style())
         return self._hover_label
+
+    def _on_hover_resize(self, width: int, height: int):
+        """Remember this icon's viewer size and persist only this row."""
+        self.hover_size = QSize(int(width), int(height))
+        if self._hover_label is not None:
+            self._hover_label._saved_hover_size = self.hover_size
+        try:
+            from core import database
+            database.update_annotation_hover_size(self.annotation_id, width, height)
+        except Exception as exc:
+            logger.debug("Could not persist annotation %s hover size: %s", self.annotation_id, exc)
 
     def _show_hover_label(self):
         label = self._ensure_hover_label()
@@ -1304,13 +1328,15 @@ class PageView(QWidget):
         self.annotation_placed.emit(annot_id, QCursor.pos())
 
     def _create_annotation_widget(self, annot_id: int, pdf_x: float, pdf_y: float,
-                                  note_text: str, note_format: str = "auto"):
+                                  note_text: str, note_format: str = "auto",
+                                  hover_size=None):
         """Create an AnnotationIconWidget from PDF coordinates."""
         widget = AnnotationIconWidget(
             annot_id,
             pdf_x * self.zoom, pdf_y * self.zoom,
             24, 24, note_text, note_format,
             unzoomed_pos=(pdf_x, pdf_y),
+            hover_size=hover_size,
             parent=self.overlay
         )
         widget.edit_requested.connect(self._on_annotation_edit_requested)
@@ -1377,7 +1403,9 @@ class PageView(QWidget):
             if annot["target_type"] == "icon":
                 self._create_annotation_widget(
                     annot["id"], annot["x"], annot["y"], annot["note_text"],
-                    annot.get("note_format", "auto")
+                    annot.get("note_format", "auto"),
+                    (annot.get("hover_width"), annot.get("hover_height"))
+                    if annot.get("hover_width") and annot.get("hover_height") else None,
                 )
 
     def update_annotation_geometries(self):

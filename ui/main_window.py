@@ -2,8 +2,9 @@
 Main application window for Knowledge Manager.
 VSCode-style layout: Activity Bar + Sidebar + Tabbed Main Area + Right Vocab Panel.
 """
+import json
 import os
-from PySide6.QtCore import Qt, QThread, Signal as QSignal, QTimer, QPoint
+from PySide6.QtCore import Qt, QThread, Signal as QSignal, QTimer, QPoint, QSize
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QCursor
 from PySide6.QtWidgets import (
     QMainWindow, QFileDialog, QToolBar, QLabel, QDockWidget,
@@ -1388,6 +1389,27 @@ class MainWindow(QMainWindow):
                     return page_view
         return None
 
+    @staticmethod
+    def _explain_hover_default_size() -> tuple[int, int]:
+        """Return the current Explain viewer size for newly saved responses.
+
+        The old implementation kept this preference globally.  Keep reading
+        that setting only as the initial size for AI-created annotations; once
+        a viewer is resized, its own annotation row becomes authoritative.
+        """
+        default_width, default_height = 270, 360
+        try:
+            raw = database.get_setting("annotation_hover_size", "")
+            if raw:
+                data = json.loads(raw)
+                width = int(data.get("width", 0))
+                height = int(data.get("height", 0))
+                if width > 0 and height > 0:
+                    return width, height
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+        return default_width, default_height
+
     def _create_explain_annotation(self, tab, popup, explanation: str):
         """Create or update the icon attached to an Explain response."""
         page_view = self._annotation_page_view(tab, popup)
@@ -1401,6 +1423,14 @@ class MainWindow(QMainWindow):
                 if widget.annotation_id == existing_id:
                     widget.note_text = explanation
                     widget.note_format = "markdown"
+                    if widget.hover_size is None:
+                        default_width, default_height = self._explain_hover_default_size()
+                        widget.hover_size = QSize(default_width, default_height)
+                        database.update_annotation_hover_size(
+                            existing_id, default_width, default_height
+                        )
+                        if widget._hover_label is not None:
+                            widget._hover_label._saved_hover_size = widget.hover_size
                     if widget._hover_label is not None:
                         widget._hover_label.hide()
                     break
@@ -1422,6 +1452,7 @@ class MainWindow(QMainWindow):
         local_y = max(0, min(local_y, max_y))
         pdf_x = local_x / page_view.zoom
         pdf_y = local_y / page_view.zoom
+        hover_width, hover_height = self._explain_hover_default_size()
         annotation_id = database.add_annotation(
             tab.pdf_path,
             page_view.page_number,
@@ -1433,6 +1464,8 @@ class MainWindow(QMainWindow):
             24,
             24,
             note_format="markdown",
+            hover_width=hover_width,
+            hover_height=hover_height,
         )
         page_view._create_annotation_widget(
             annotation_id,
@@ -1440,6 +1473,7 @@ class MainWindow(QMainWindow):
             pdf_y,
             explanation,
             "markdown",
+            hover_size=(hover_width, hover_height),
         )
         popup.saved_annotation_id = annotation_id
         return annotation_id
