@@ -281,7 +281,11 @@ class PdfScrollView(QWidget):
             for hw in pv.highlight_widgets:
                 hw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, active)
             for aw in pv.annotation_widgets:
-                aw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, active)
+                # Annotation icons remain independent interactive targets in
+                # Explain Mode: hover, pinning, dragging, and double-click
+                # editing must continue to work. They simply do not contribute
+                # words to an Explain selection because they consume the event.
+                aw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
 
     def set_annotation_mode(self, active: bool):
         for pv in self.page_views:

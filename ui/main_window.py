@@ -1446,8 +1446,8 @@ class MainWindow(QMainWindow):
 
     def _on_explain_save(self, word: str, explanation: str, tab, popup=None):
         """Save the response cache and attach the response to a page icon."""
-        explanation = (explanation or "").strip()
-        if not explanation:
+        explanation = explanation or ""
+        if not explanation.strip():
             self.status_label.setText("Nothing to save yet.")
             return
 

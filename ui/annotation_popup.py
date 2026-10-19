@@ -202,7 +202,10 @@ class AnnotationEditPopup(QDialog):
         layout.addLayout(btn_row)
 
     def _on_save(self):
-        self.result_text = self.text_edit.toPlainText().strip()
+        # Preserve Markdown indentation and line breaks exactly as pasted. An
+        # all-whitespace note is still treated as an empty annotation.
+        text = self.text_edit.toPlainText()
+        self.result_text = text if text.strip() else ""
         self.accept()
 
     def _on_delete(self):

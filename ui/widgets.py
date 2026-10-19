@@ -3,10 +3,12 @@ Custom widgets for PDF page rendering and word-level interaction.
 """
 import random
 import re
-from PySide6.QtCore import Qt, Signal, QRect, QPoint
+import math
+import json
+from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QEvent
 from PySide6.QtGui import QColor, QPainter, QPixmap, QPen, QTextDocument
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QSizePolicy, QApplication
+    QWidget, QLabel, QSizePolicy, QApplication, QTextBrowser, QFrame
 )
 
 from core.pdf_engine import PdfEngine
@@ -23,7 +25,7 @@ def _get_hover_label_style() -> str:
     text = colors.get("text", "#ffffff")
     border = colors.get("border", "#555555")
     return (
-        "QLabel {"
+        "QLabel, QTextBrowser {"
         f"background: {bg};"
         f"color: {text};"
         f"border: 1px solid {border};"
@@ -31,11 +33,21 @@ def _get_hover_label_style() -> str:
         "padding: 6px 10px;"
         "font-size: 12px;"
         "}"
+        "QTextBrowser {"
+        "padding: 6px 10px;"
+        "}"
+        "QTextBrowser QScrollBar:vertical {"
+        "width: 10px;"
+        "margin: 2px;"
+        "}"
     )
 
 
 _HOVER_LABEL_MAX_WIDTH = 270
+_HOVER_LABEL_MAX_HEIGHT = 360
 _HOVER_LABEL_MARGIN = 8
+_HOVER_LABEL_MIN_WIDTH = 120
+_HOVER_LABEL_MIN_HEIGHT = 60
 
 
 def _looks_like_markdown(text: str) -> bool:
@@ -51,6 +63,9 @@ def _looks_like_markdown(text: str) -> bool:
         r"^\s*>\s+\S+",                # block quotes
         r"^\s*```",                     # fenced code
         r"^\s*\|.+\|\s*$",             # tables
+        r"^\s{4,}\S+",                 # indented code blocks
+        r"^\s*(?:[-*_]\s*){3,}$",      # horizontal rules
+        r"^\s*=+\s*$",                  # setext heading underline
     )
     if any(re.search(pattern, line) for line in lines for pattern in marker_patterns):
         return True
@@ -78,21 +93,358 @@ def _render_hover_text(text: str, note_format: str = "auto") -> tuple[str, Qt.Te
     return document.toHtml(), Qt.TextFormat.RichText
 
 
-def _prepare_hover_label(label: QLabel, text: str, note_format: str = "auto"):
-    """Size a hover label and render Markdown notes as rich text."""
+def _load_hover_size() -> QSize | None:
+    """Read the user's preferred hover size, if one has been saved."""
+    try:
+        from core import database
+        raw = database.get_setting("annotation_hover_size", "")
+        if raw:
+            data = json.loads(raw)
+            width = int(data.get("width", 0))
+            height = int(data.get("height", 0))
+            if width > 0 and height > 0:
+                return QSize(width, height)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _save_hover_size(width: int, height: int):
+    """Persist a user-resized hover window for future annotations."""
+    try:
+        from core import database
+        database.save_setting(
+            "annotation_hover_size",
+            json.dumps({"width": int(width), "height": int(height)}),
+        )
+    except Exception as exc:
+        logger.debug("Could not persist annotation hover size: %s", exc)
+
+
+class HoverTextBrowser(QTextBrowser):
+    """Scrollable hover viewer with a bottom-right resize handle."""
+
+    resize_finished = Signal(int, int)
+    _RESIZE_HANDLE_SIZE = 20
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self._resizing = False
+        self._resize_origin = None
+        self._resize_start_size = None
+        self._user_resized = False
+        self._resize_enabled = False
+        self._app_filter_installed = False
+        # The grip owns the innermost part of the resize corner.  The
+        # surrounding viewport/scrollbar filters below cover the remaining
+        # few pixels, which also makes the handle reliable over Qt's scroll
+        # bar corner widget.
+        self._resize_grip = _HoverResizeGrip(self)
+        self._resize_grip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._resize_grip.show()
+        # QAbstractScrollArea's viewport does not report passive mouse moves
+        # by default.  Enable tracking on every child that can be underneath
+        # the pointer so the diagonal resize cursor appears before pressing.
+        self.viewport().setMouseTracking(True)
+        self.verticalScrollBar().setMouseTracking(True)
+        self.horizontalScrollBar().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
+        self.verticalScrollBar().installEventFilter(self)
+        self.horizontalScrollBar().installEventFilter(self)
+
+    def _set_child_cursor(self, shape):
+        """Apply a cursor to every scroll-area child that may be under it."""
+        self.setCursor(shape)
+        self.viewport().setCursor(shape)
+        self.verticalScrollBar().setCursor(shape)
+        self.horizontalScrollBar().setCursor(shape)
+        if self._resize_grip is not None:
+            self._resize_grip.setCursor(shape)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._resize_grip is not None:
+            size = self._resize_grip.sizeHint().width()
+            self._resize_grip.setGeometry(self.width() - size, self.height() - size, size, size)
+            self._resize_grip.raise_()
+
+    def set_resize_enabled(self, enabled: bool):
+        """Enable the resize handle only while the viewer is pinned."""
+        enabled = bool(enabled)
+        if not enabled and self._resizing:
+            # A pinned viewer can be unpinned while a drag is in progress.
+            # Always release the mouse grab before hiding it, otherwise Qt
+            # keeps routing all page events to this invisible child.
+            self._finish_resize()
+        self._resize_enabled = enabled
+        app = QApplication.instance()
+        if enabled:
+            if app is not None and not self._app_filter_installed:
+                app.installEventFilter(self)
+                self._app_filter_installed = True
+        elif app is not None and self._app_filter_installed:
+            app.removeEventFilter(self)
+            self._app_filter_installed = False
+        if self._resize_grip is not None:
+            self._resize_grip.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, not enabled
+            )
+            self._resize_grip.setCursor(
+                Qt.CursorShape.SizeFDiagCursor if enabled else Qt.CursorShape.ArrowCursor
+            )
+            self._resize_grip.raise_()
+        self._set_child_cursor(Qt.CursorShape.ArrowCursor)
+        if enabled and self._resize_grip is not None:
+            # _set_child_cursor also updates the grip; restore its persistent
+            # resize cursor after applying the normal arrow to the browser.
+            self._resize_grip.setCursor(Qt.CursorShape.SizeFDiagCursor)
+
+    def _in_resize_handle(self, pos) -> bool:
+        """Return whether *pos* (in this widget's coordinates) is in the grip."""
+        return (
+            pos.x() >= self.width() - self._RESIZE_HANDLE_SIZE
+            and pos.y() >= self.height() - self._RESIZE_HANDLE_SIZE
+        )
+
+    def _global_in_resize_handle(self, global_pos) -> bool:
+        return self._in_resize_handle(self.mapFromGlobal(global_pos))
+
+    def _update_resize_cursor(self, global_pos):
+        if self._resize_enabled and self._global_in_resize_handle(global_pos):
+            self._set_child_cursor(Qt.CursorShape.SizeFDiagCursor)
+        else:
+            self._set_child_cursor(Qt.CursorShape.ArrowCursor)
+        # Keep the actual handle's cursor independent of whichever child
+        # (viewport or scrollbar) last reported a move.  This avoids a stale
+        # arrow when the pointer re-enters the corner without crossing the
+        # viewport boundary.
+        if self._resize_enabled and self._resize_grip is not None:
+            self._resize_grip.setCursor(Qt.CursorShape.SizeFDiagCursor)
+
+    def _start_resize(self, global_pos):
+        if not self._resize_enabled or self._resizing:
+            return
+        self._resizing = True
+        self._resize_origin = global_pos
+        self._resize_start_size = self.size()
+        self._set_child_cursor(Qt.CursorShape.SizeFDiagCursor)
+        # The application-level event filter below continues to receive move
+        # and release events after the pointer leaves this child.  Avoid
+        # QWidget.grabMouse(): on Windows a native mouse grab can keep all
+        # page input routed to the hover widget when a release is missed.
+        app = QApplication.instance()
+        if app is not None and not self._app_filter_installed:
+            app.installEventFilter(self)
+            self._app_filter_installed = True
+
+    def _resize_to(self, global_pos):
+        if not self._resizing or self._resize_origin is None or self._resize_start_size is None:
+            return
+        # Do not use QApplication.mouseButtons() as a drag-state gate here.
+        # On Windows, after a child widget starts a mouse grab this value can
+        # briefly be empty while a MouseMove event is still being delivered.
+        # Treating that transient state as a release made real drags appear to
+        # do nothing.  The application-level event filter below owns the
+        # release path and always calls _finish_resize on MouseButtonRelease
+        # or deactivation.
+        delta = global_pos - self._resize_origin
+        parent = self.parentWidget()
+        min_width = max(_HOVER_LABEL_MIN_WIDTH, self.minimumWidth())
+        min_height = max(_HOVER_LABEL_MIN_HEIGHT, self.minimumHeight())
+        max_width = self._resize_start_size.width() + delta.x()
+        max_height = self._resize_start_size.height() + delta.y()
+        if parent is not None:
+            top_left = self.mapTo(parent, QPoint(0, 0))
+            max_width = min(max_width, parent.width() - top_left.x() - _HOVER_LABEL_MARGIN)
+            max_height = min(max_height, parent.height() - top_left.y() - _HOVER_LABEL_MARGIN)
+        width = max(min_width, int(max_width))
+        height = max(min_height, int(max_height))
+        self.resize(width, height)
+
+    def _finish_resize(self, global_pos=None):
+        if not self._resizing:
+            return
+        self._resizing = False
+        self._resize_origin = None
+        self._resize_start_size = None
+        self._user_resized = True
+        self._set_child_cursor(Qt.CursorShape.ArrowCursor)
+        if self._resize_enabled and self._resize_grip is not None:
+            self._resize_grip.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            if global_pos is not None and self._global_in_resize_handle(global_pos):
+                self._set_child_cursor(Qt.CursorShape.SizeFDiagCursor)
+        self.resize_finished.emit(self.width(), self.height())
+
+    def eventFilter(self, watched, event):
+        app = QApplication.instance()
+        if watched is app:
+            event_type = event.type()
+            if self._resizing and event_type == QEvent.Type.MouseMove:
+                self._resize_to(event.globalPosition().toPoint())
+                # The owner has a mouse grab, so consume the move here.  This
+                # keeps the resize path independent of which QTextBrowser
+                # child (viewport, scrollbar, or corner widget) owns it.
+                return True
+            if self._resizing and event_type == QEvent.Type.MouseButtonRelease:
+                self._finish_resize(event.globalPosition().toPoint())
+                return True
+            if self._resizing and event_type in (
+                QEvent.Type.WindowDeactivate,
+                QEvent.Type.ApplicationDeactivate,
+            ):
+                self._finish_resize()
+                return True
+            if self._resize_enabled and event_type == QEvent.Type.MouseMove:
+                self._update_resize_cursor(event.globalPosition().toPoint())
+                return False
+            if (
+                self._resize_enabled
+                and event_type == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+            ):
+                global_pos = event.globalPosition().toPoint()
+                if self._global_in_resize_handle(global_pos):
+                    self._start_resize(global_pos)
+                    return True
+            return False
+        if watched in (self.viewport(), self.verticalScrollBar(), self.horizontalScrollBar()):
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                global_pos = event.globalPosition().toPoint()
+                if self._resize_enabled and self._global_in_resize_handle(global_pos):
+                    self._start_resize(global_pos)
+                    return True
+            elif event_type == QEvent.Type.MouseMove and self._resizing:
+                self._resize_to(event.globalPosition().toPoint())
+                return True
+            elif event_type == QEvent.Type.MouseButtonRelease and self._resizing:
+                self._finish_resize()
+                return True
+            elif event_type == QEvent.Type.MouseMove and self._resize_enabled:
+                self._update_resize_cursor(event.globalPosition().toPoint())
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event):
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._resize_enabled
+            and self._in_resize_handle(event.position().toPoint())
+        ):
+            self._start_resize(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resizing and self._resize_origin is not None and self._resize_start_size is not None:
+            self._resize_to(event.globalPosition().toPoint())
+            event.accept()
+            return
+
+        if self._resize_enabled:
+            self._update_resize_cursor(event.globalPosition().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._resizing and event.button() == Qt.MouseButton.LeftButton:
+            self._finish_resize()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def hideEvent(self, event):
+        # A pinned viewer can be hidden while a resize gesture is active
+        # (for example when its icon is unpinned). Finish the gesture before
+        # the widget disappears so no pending resize state survives.
+        if self._resizing:
+            self._finish_resize()
+        super().hideEvent(event)
+
+    def focusOutEvent(self, event):
+        if self._resizing:
+            self._finish_resize()
+        super().focusOutEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+
+class _HoverResizeGrip(QWidget):
+    """Small child widget that keeps resize events out of QTextBrowser's viewport."""
+
+    def __init__(self, owner: HoverTextBrowser):
+        super().__init__(owner)
+        self.owner = owner
+        self.setFixedSize(18, 18)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+
+    def sizeHint(self):
+        return QSize(18, 18)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.owner._start_resize(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.owner._resizing:
+            self.owner._resize_to(event.globalPosition().toPoint())
+            event.accept()
+            return
+        if self.owner._resize_enabled:
+            self.owner._update_resize_cursor(event.globalPosition().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.owner._resizing:
+            self.owner._finish_resize()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        colors = get_theme_colors()
+        pen = QPen(QColor(colors.get("border", "#777777")))
+        pen.setWidth(1)
+        painter.setPen(pen)
+        x = self.width() - 4
+        y = self.height() - 4
+        painter.drawLine(x - 8, y, x, y - 8)
+        painter.drawLine(x - 12, y, x, y - 12)
+        painter.end()
+
+
+def _create_hover_browser(parent: QWidget) -> HoverTextBrowser:
+    """Create a bounded, scrollable hover viewer."""
+    browser = HoverTextBrowser(parent)
+    browser.setReadOnly(True)
+    browser.setUndoRedoEnabled(False)
+    browser.setFrameShape(QFrame.Shape.NoFrame)
+    browser.setOpenLinks(False)
+    browser.setOpenExternalLinks(False)
+    browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    browser.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    browser.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+    browser.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    browser.document().setDocumentMargin(0)
+    browser.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    browser.resize_finished.connect(_save_hover_size)
+    return browser
+
+
+def _prepare_hover_label(label: QWidget, text: str, note_format: str = "auto"):
+    """Size a hover viewer inside the page and render Markdown notes as rich text."""
     parent = label.parentWidget()
     available_width = parent.width() - (_HOVER_LABEL_MARGIN * 2) if parent else 0
-    max_width = _HOVER_LABEL_MAX_WIDTH
-    if available_width > 0:
-        max_width = min(max_width, available_width)
+    page_max_width = max(40, available_width) if available_width > 0 else _HOVER_LABEL_MAX_WIDTH
+    max_width = min(_HOVER_LABEL_MAX_WIDTH, page_max_width)
 
     rendered_text, text_format = _render_hover_text(text, note_format)
-    label.setWordWrap(True)
-    label.setMinimumWidth(0)
-    label.setMaximumWidth(max_width)
-    label.setTextFormat(text_format)
-    label.setText(rendered_text)
-    label.setOpenExternalLinks(False)
 
     # Keep short notes compact while capping long notes at max_width.
     longest_line = max(
@@ -100,11 +452,60 @@ def _prepare_hover_label(label: QLabel, text: str, note_format: str = "auto"):
         default=0,
     )
     content_width = longest_line + 22  # stylesheet padding plus border
-    label.setFixedWidth(min(max_width, max(80, content_width)))
-    label.adjustSize()
+    width = min(max_width, max(min(160, max_width), content_width))
+
+    if isinstance(label, HoverTextBrowser):
+        if text_format == Qt.TextFormat.RichText:
+            label.setHtml(rendered_text)
+        else:
+            label.setPlainText(text)
+        saved_size = _load_hover_size()
+        if getattr(label, "_user_resized", False):
+            width = label.width()
+            requested_height = label.height()
+        elif saved_size is not None:
+            width = saved_size.width()
+            requested_height = saved_size.height()
+        else:
+            requested_height = None
+
+        min_width = min(_HOVER_LABEL_MIN_WIDTH, max_width)
+        if getattr(label, "_user_resized", False) or saved_size is not None:
+            width = max(min_width, min(page_max_width, width))
+        else:
+            width = max(min_width, min(max_width, width))
+        label.setMinimumWidth(min_width)
+        label.setMaximumWidth(page_max_width)
+        label.resize(width, max(label.height(), _HOVER_LABEL_MIN_HEIGHT))
+        # Tell Qt the available line width before measuring the document. The
+        # resulting height is bounded, so long answers become scrollable.
+        label.document().setTextWidth(max(1, width - 22))
+        document_height = label.document().documentLayout().documentSize().height()
+        available_height = parent.height() - (_HOVER_LABEL_MARGIN * 2) if parent else 0
+        page_max_height = max(40, available_height) if available_height > 0 else _HOVER_LABEL_MAX_HEIGHT
+        max_height = min(_HOVER_LABEL_MAX_HEIGHT, page_max_height)
+        if requested_height is None:
+            requested_height = math.ceil(document_height + 18)
+        min_height = min(_HOVER_LABEL_MIN_HEIGHT, max_height)
+        if getattr(label, "_user_resized", False) or saved_size is not None:
+            height = max(min_height, min(page_max_height, int(requested_height)))
+        else:
+            height = max(min_height, min(max_height, int(requested_height)))
+        label.setMinimumHeight(min_height)
+        label.setMaximumHeight(page_max_height)
+        label.resize(width, height)
+    else:
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setMaximumWidth(max_width)
+        label.setTextFormat(text_format)
+        label.setText(rendered_text)
+        label.setOpenExternalLinks(False)
+        label.setFixedWidth(width)
+        label.adjustSize()
 
 
-def _position_hover_label(anchor: QWidget, label: QLabel, offset: QPoint):
+def _position_hover_label(anchor: QWidget, label: QWidget, offset: QPoint):
     """Place a hover label beside its anchor without leaving the page overlay."""
     parent = anchor.parentWidget()
     if parent is None:
@@ -376,6 +777,7 @@ class AnnotationIconWidget(QWidget):
         self._drag_start = None
         self._drag_offset = None
         self._dragging = False
+        self._hover_pinned = False
         # Floating label for hover display (child widget, not a separate window)
         self._hover_label = None
 
@@ -416,8 +818,7 @@ class AnnotationIconWidget(QWidget):
             if not self._dragging and (abs(delta.x()) > 5 or abs(delta.y()) > 5):
                 self._dragging = True
                 self.setCursor(Qt.CursorShape.ClosedHandCursor)
-                if self._hover_label is not None:
-                    self._hover_label.hide()
+                self._hide_hover_label(force=True)
                 self.drag_started.emit(current)
             if self._dragging:
                 self.drag_moved.emit(current)
@@ -440,6 +841,8 @@ class AnnotationIconWidget(QWidget):
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             if was_dragging:
                 self.drag_finished.emit(global_pos)
+            else:
+                self._toggle_hover_pin()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -473,28 +876,74 @@ class AnnotationIconWidget(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # A double-click is reserved for editing, so do not leave the
+            # hover viewer pinned after the edit gesture completes.
+            self._hide_hover_label(force=True)
             self.edit_requested.emit(self.annotation_id, event.globalPosition().toPoint())
             event.accept()
 
+    def _ensure_hover_label(self):
+        if self._hover_label is None:
+            self._hover_label = _create_hover_browser(self.parentWidget())
+            self._hover_label.setStyleSheet(_get_hover_label_style())
+        return self._hover_label
+
+    def _show_hover_label(self):
+        label = self._ensure_hover_label()
+        display = self.note_text if self.note_text else "(Double-click to add note)"
+        _prepare_hover_label(label, display, self.note_format)
+        _position_hover_label(self, label, QPoint(28, 0))
+        label.show()
+        label.raise_()
+
+    def _set_hover_pinned(self, pinned: bool):
+        self._hover_pinned = pinned
+        if self._hover_label is None:
+            return
+        self._hover_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, not pinned
+        )
+        self._hover_label.setFocusPolicy(
+            Qt.FocusPolicy.StrongFocus if pinned else Qt.FocusPolicy.NoFocus
+        )
+        if isinstance(self._hover_label, HoverTextBrowser):
+            self._hover_label.set_resize_enabled(pinned)
+
+    def _toggle_hover_pin(self):
+        if not self.note_text and self._hover_label is None:
+            self._show_hover_label()
+        self._set_hover_pinned(not self._hover_pinned)
+        if self._hover_pinned:
+            self._show_hover_label()
+            self._hover_label.setFocus()
+        else:
+            self._hide_hover_label(force=True)
+            self.hover_left.emit(self.annotation_id)
+
+    def _hide_hover_label(self, force: bool = False):
+        if self._hover_pinned and not force:
+            return
+        if force:
+            self._hover_pinned = False
+        if self._hover_label is not None:
+            self._hover_label.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+            )
+            if isinstance(self._hover_label, HoverTextBrowser):
+                self._hover_label.set_resize_enabled(False)
+            self._hover_label.hide()
+
     def enterEvent(self, event):
         from PySide6.QtGui import QCursor
-        # Create hover label as child widget (no window system delay)
-        if self._hover_label is None:
-            self._hover_label = QLabel(self.parentWidget())
-            self._hover_label.setStyleSheet(_get_hover_label_style())
-            self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        display = self.note_text if self.note_text else "(Double-click to add note)"
-        _prepare_hover_label(self._hover_label, display, self.note_format)
-        _position_hover_label(self, self._hover_label, QPoint(28, 0))
-        self._hover_label.show()
-        self._hover_label.raise_()
+        # Create a scrollable child viewer without leaving the page overlay.
+        self._show_hover_label()
         self.hover_entered.emit(self.annotation_id, self.note_text, QCursor.pos())
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        if self._hover_label is not None:
-            self._hover_label.hide()
-        self.hover_left.emit(self.annotation_id)
+        self._hide_hover_label()
+        if not self._hover_pinned:
+            self.hover_left.emit(self.annotation_id)
         super().leaveEvent(event)
 
 class HighlightWidget(QWidget):
@@ -600,9 +1049,8 @@ class HighlightWidget(QWidget):
             from PySide6.QtGui import QCursor
             # Create hover label as child widget (no window system delay)
             if self._hover_label is None:
-                self._hover_label = QLabel(self.parentWidget())
+                self._hover_label = _create_hover_browser(self.parentWidget())
                 self._hover_label.setStyleSheet(_get_hover_label_style())
-                self._hover_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             _prepare_hover_label(self._hover_label, self.annotation_text, self.annotation_format)
             _position_hover_label(self, self._hover_label, QPoint(10, -30))
             self._hover_label.show()
@@ -969,10 +1417,20 @@ class PageView(QWidget):
 
     def _check_tooltip_hide(self, local_pos):
         """Hide tooltip if mouse is not over any annotation widget or highlight."""
+        # A pinned viewer remains available while the cursor moves from the
+        # icon into the viewer (and while the user scrolls inside it).
+        for widget in self.annotation_widgets:
+            if getattr(widget, "_hover_pinned", False):
+                return
+
         # Check if mouse is over any annotation icon
         for widget in self.annotation_widgets:
             if widget.geometry().contains(local_pos):
                 return  # Still over an icon, don't hide
+
+            label = getattr(widget, "_hover_label", None)
+            if label is not None and label.isVisible() and label.geometry().contains(local_pos):
+                return  # Still over an unpinned viewer during the transition
         
         # Check if mouse is over any highlight with annotation
         for hw in self.highlight_widgets:
@@ -985,7 +1443,9 @@ class PageView(QWidget):
     def _hide_all_tooltips(self):
         """Hide all hover labels immediately."""
         for widget in self.annotation_widgets:
-            if widget._hover_label is not None:
+            if hasattr(widget, "_hide_hover_label"):
+                widget._hide_hover_label()
+            elif widget._hover_label is not None:
                 widget._hover_label.hide()
         for hw in self.highlight_widgets:
             if hw._hover_label is not None:
