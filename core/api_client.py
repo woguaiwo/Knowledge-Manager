@@ -415,6 +415,7 @@ def explain_chat_stream(
     proxy: str = "",
     temperature: float = 0.7,
     max_tokens: int = 4096,
+    cancel_event=None,
 ):
     """
     Send a chat conversation to AI API with streaming (SSE).
@@ -446,6 +447,8 @@ def explain_chat_stream(
 
     _logger.info(f"[API] explain_chat_stream -> {url} model={model} stream=True")
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         resp = requests.post(
             url,
             headers=headers,
@@ -490,6 +493,15 @@ def explain_chat_stream(
 
         content_filter = _ReasoningContentFilter()
         for line in resp.iter_lines():
+            if cancel_event is not None and cancel_event.is_set():
+                # Closing the response releases the socket as soon as the
+                # iterator yields control.  The worker also stops forwarding
+                # queued chunks, so closing the popup remains immediate.
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return
             if not line:
                 continue
             line_str = line.decode("utf-8")

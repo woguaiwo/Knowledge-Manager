@@ -14,6 +14,7 @@ class PdfScrollView(QWidget):
     words_collected = Signal(list, int, str)  # list[str], page_number, context
     explain_requested = Signal(str, str, object)  # selected_text, context, global_pos (QPoint)
     image_clicked = Signal(int, int)  # page_number, image_index
+    image_region_selected = Signal(int, object, object)  # page_number, QImage, global_pos
     page_double_clicked = Signal(int)  # page_number
     link_clicked = Signal(dict)  # link data dict
     page_changed = Signal(int)      # 0-based primary visible page index
@@ -76,6 +77,7 @@ class PdfScrollView(QWidget):
             pv.words_collected.connect(self.words_collected)
             pv.explain_requested.connect(self.explain_requested)
             pv.image_clicked.connect(self.image_clicked)
+            pv.image_region_selected.connect(self.image_region_selected)
             pv.page_double_clicked.connect(self.page_double_clicked)
             pv.link_clicked.connect(self.link_clicked)
             pv.annotation_drag_started.connect(self._begin_annotation_drag)
@@ -88,6 +90,10 @@ class PdfScrollView(QWidget):
         if self._annotation_drag is not None:
             self._cancel_annotation_drag()
         for pv in self.page_views:
+            # Remove any Explain Mode application filter before the page is
+            # scheduled for deletion; otherwise a closing tab could continue
+            # seeing global mouse events until Qt processes deleteLater().
+            pv.set_explain_mode(False)
             self.container_layout.removeWidget(pv)
             pv.deleteLater()
         self.page_views.clear()
@@ -275,11 +281,17 @@ class PdfScrollView(QWidget):
 
     def set_explain_mode(self, active: bool):
         for pv in self.page_views:
-            pv.explain_mode = active
+            pv.set_explain_mode(active)
             # Make highlights transparent to mouse events in explain mode
             # so users can select text underneath
             for hw in pv.highlight_widgets:
                 hw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, active)
+            for iw in pv.image_hit_widgets:
+                # Some PDFs contain a full-page image plus an extracted text
+                # layer.  Let text selection reach WordWidgets in Explain
+                # Mode; PageView's overlay still handles clicks on image-only
+                # areas and emits the normal image explanation signal.
+                iw.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, active)
             for aw in pv.annotation_widgets:
                 # Annotation icons remain independent interactive targets in
                 # Explain Mode: hover, pinning, dragging, and double-click

@@ -5,9 +5,10 @@ import random
 import re
 import math
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QEvent
-from PySide6.QtGui import QColor, QPainter, QPixmap, QPen, QTextDocument
+from PySide6.QtGui import QColor, QPainter, QPixmap, QPen, QTextDocument, QImage
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QSizePolicy, QApplication, QTextBrowser, QFrame
+    QWidget, QLabel, QSizePolicy, QApplication, QTextBrowser, QFrame,
+    QRubberBand,
 )
 
 from core.pdf_engine import PdfEngine
@@ -628,6 +629,18 @@ class WordWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            # Ctrl-drag is reserved for Explain Mode's rectangular image
+            # capture.  Start it before ordinary word selection so a gesture
+            # beginning on a text widget cannot be mistaken for a text query.
+            page_view = self._get_page_view()
+            if (
+                page_view is not None
+                and page_view.explain_mode
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            ):
+                page_view._start_region_selection(event.globalPosition().toPoint())
+                event.accept()
+                return
             self._handle_press()
         self.clicked.emit(self.text, self.page, self.block, self.line)
         event.accept()  # ensure mouse grab so we receive move/release even when cursor leaves
@@ -703,8 +716,25 @@ class ImageHitWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            page_view = self._get_page_view()
+            if (
+                page_view is not None
+                and page_view.explain_mode
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            ):
+                page_view._start_region_selection(event.globalPosition().toPoint())
+                event.accept()
+                return
             self.image_clicked.emit(self.page_number, self.image_index)
         event.accept()
+
+    def _get_page_view(self):
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, PageView):
+                return parent
+            parent = parent.parent()
+        return None
 
 
 class LinkWidget(QWidget):
@@ -753,8 +783,25 @@ class LinkWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            page_view = self._get_page_view()
+            if (
+                page_view is not None
+                and page_view.explain_mode
+                and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+            ):
+                page_view._start_region_selection(event.globalPosition().toPoint())
+                event.accept()
+                return
             self.link_clicked.emit(self.link_data)
         event.accept()
+
+    def _get_page_view(self):
+        parent = self.parent()
+        while parent:
+            if isinstance(parent, PageView):
+                return parent
+            parent = parent.parent()
+        return None
 
 
 class AnnotationIconWidget(QWidget):
@@ -1220,6 +1267,7 @@ class PageView(QWidget):
     words_collected = Signal(list, int, str)  # list[str], page_number, context
     explain_requested = Signal(str, str, object)  # selected_text, context, global_pos (QPoint)
     image_clicked = Signal(int, int)  # page_number, image_index
+    image_region_selected = Signal(int, object, object)  # page_number, QImage, global_pos
     page_double_clicked = Signal(int)  # page_number
     link_clicked = Signal(dict)  # link data dict
     annotation_edit_requested = Signal(int, object)      # annotation_id, global_pos
@@ -1229,6 +1277,7 @@ class PageView(QWidget):
     annotation_drag_started = Signal(object, object)      # widget, global_pos
     annotation_drag_moved = Signal(object, object)        # widget, global_pos
     annotation_drag_finished = Signal(object, object)     # widget, global_pos
+    _REGION_CAPTURE_MAX_SIZE = 1600
 
     def __init__(self, engine: PdfEngine, page_number: int, zoom: float = 1.5, parent=None):
         super().__init__(parent)
@@ -1274,6 +1323,12 @@ class PageView(QWidget):
 
         self.selection_active = False
         self.selected_widgets: set[WordWidget] = set()
+        # Text selection used to rely on overlay.grabMouse().  On Windows a
+        # native child-widget mouse grab can occasionally swallow the release
+        # event, leaving Explain Mode with a selection that never emits.  Keep
+        # a short-lived application-level filter instead so movement/release
+        # are handled consistently even when the pointer crosses widgets.
+        self._selection_app_filter_installed = False
         self.vocab_mode = False
         self.explain_mode = False
         self.highlight_mode = False
@@ -1281,7 +1336,143 @@ class PageView(QWidget):
         self.annotation_widgets: list[AnnotationIconWidget] = []
         self._image_dirty = False
 
+        # Ctrl + drag in Explain Mode captures a rectangular portion of the
+        # rendered page.  Word/Image/overlay press handlers start the gesture;
+        # the application-level filter is installed only while it is active
+        # so movement/release survive child-widget boundaries.
+        self._region_filter_installed = False
+        self._region_selecting = False
+        self._region_origin = None
+        self._region_band = None
+
         self.load_page()
+
+    def set_explain_mode(self, active: bool):
+        """Enable Explain Mode and its optional Ctrl-drag image capture."""
+        self.explain_mode = bool(active)
+        app = QApplication.instance()
+        if not self.explain_mode:
+            self._cancel_region_selection()
+            if app is not None and self._region_filter_installed:
+                try:
+                    app.removeEventFilter(self)
+                except RuntimeError:
+                    pass
+            self._region_filter_installed = False
+
+    @staticmethod
+    def _event_global_pos(event):
+        """Return a mouse event's global QPoint across Qt6 event variants."""
+        try:
+            return event.globalPosition().toPoint()
+        except AttributeError:
+            try:
+                return event.globalPos()
+            except AttributeError:
+                return None
+
+    def _region_point(self, global_pos):
+        """Map a global point to the rendered page and clamp it to its bounds."""
+        local = self.overlay.mapFromGlobal(global_pos)
+        rect = self.image_label.rect()
+        if rect.isNull():
+            return QPoint()
+        x = max(rect.left(), min(rect.right(), local.x()))
+        y = max(rect.top(), min(rect.bottom(), local.y()))
+        return QPoint(x, y)
+
+    def _start_region_selection(self, global_pos):
+        if not self.explain_mode or self._region_selecting:
+            return
+        if self.selection_active:
+            # A normal-mode text selection may still be active when the user
+            # begins a Ctrl gesture.  Clear it before handing the mouse path
+            # over to the region capture filter.
+            self.clear_selection()
+        # Install the application filter only for the duration of an active
+        # rectangle gesture.  Keeping one filter alive per PDF page made
+        # every mouse event traverse every page and caused severe lag on
+        # documents with many pages.
+        app = QApplication.instance()
+        if app is not None and not self._region_filter_installed:
+            app.installEventFilter(self)
+            self._region_filter_installed = True
+        origin = self._region_point(global_pos)
+        self._region_origin = origin
+        self._region_selecting = True
+        if self._region_band is None:
+            self._region_band = QRubberBand(QRubberBand.Shape.Rectangle, self.overlay)
+            self._region_band.setStyleSheet(
+                "QRubberBand { border: 2px solid #42a5f5; "
+                "background: rgba(66, 165, 245, 45); }"
+            )
+        self._region_band.setGeometry(QRect(origin, origin))
+        self._region_band.show()
+        self._region_band.raise_()
+
+    def _update_region_selection(self, global_pos):
+        if not self._region_selecting or self._region_origin is None:
+            return
+        current = self._region_point(global_pos)
+        rect = QRect(self._region_origin, current).normalized().intersected(self.image_label.rect())
+        self._region_band.setGeometry(rect)
+        self._region_band.show()
+
+    def _finish_region_selection(self, global_pos):
+        if not self._region_selecting:
+            return
+        self._update_region_selection(global_pos)
+        rect = self._region_band.geometry().intersected(self.image_label.rect()) if self._region_band else QRect()
+        self._region_selecting = False
+        self._region_origin = None
+        if self._region_band is not None:
+            self._region_band.hide()
+        app = QApplication.instance()
+        if app is not None and self._region_filter_installed:
+            try:
+                app.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._region_filter_installed = False
+
+        # Ignore accidental clicks and one-pixel gestures.  A small minimum
+        # also prevents an ordinary Ctrl-click from opening an empty popup.
+        if rect.width() < 8 or rect.height() < 8:
+            return
+        pixmap = self.image_label.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return
+        rect = rect.intersected(pixmap.rect())
+        if rect.width() < 8 or rect.height() < 8:
+            return
+        # Render directly into a bounded QImage instead of copying a very
+        # large source rectangle first and scaling it afterwards.  This keeps
+        # drag-release responsive even on high-zoom pages or 4K displays.
+        max_side = self._REGION_CAPTURE_MAX_SIZE
+        scale = min(1.0, max_side / max(rect.width(), rect.height()))
+        target_width = max(1, int(round(rect.width() * scale)))
+        target_height = max(1, int(round(rect.height() * scale)))
+        image = QImage(target_width, target_height, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, scale < 1.0)
+        painter.drawPixmap(QRect(0, 0, target_width, target_height), pixmap, rect)
+        painter.end()
+        anchor = self.mapToGlobal(rect.center())
+        self.image_region_selected.emit(self.page_number, image, anchor)
+
+    def _cancel_region_selection(self):
+        self._region_selecting = False
+        self._region_origin = None
+        if self._region_band is not None:
+            self._region_band.hide()
+        app = QApplication.instance()
+        if app is not None and self._region_filter_installed:
+            try:
+                app.removeEventFilter(self)
+            except RuntimeError:
+                pass
+        self._region_filter_installed = False
 
     def _on_overlay_press(self, event):
         local_pos = event.pos()
@@ -1289,12 +1480,26 @@ class PageView(QWidget):
         if self.annotation_mode:
             self._place_annotation_at(local_pos)
             return
+        if (
+            self.explain_mode
+            and event.button() == Qt.MouseButton.LeftButton
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self._start_region_selection(event.globalPosition().toPoint())
+            event.accept()
+            return
         for w in self.word_widgets:
             if w.geometry().contains(local_pos):
                 self.clear_image_selections()
                 return
         for iw in self.image_hit_widgets:
             if iw.geometry().contains(local_pos):
+                if self.explain_mode:
+                    # Image hit areas are transparent in Explain Mode so an
+                    # extracted text layer can receive the gesture.  If this
+                    # spot contains no WordWidget, keep image explanations
+                    # working through the page overlay.
+                    self.image_clicked.emit(self.page_number, iw.image_index)
                 return
         for lw in self.link_widgets:
             if lw.geometry().contains(local_pos):
@@ -1419,6 +1624,12 @@ class PageView(QWidget):
         """Remove an annotation widget by id."""
         for widget in self.annotation_widgets[:]:
             if widget.annotation_id == annot_id:
+                # The hover browser is a separate overlay child so it does
+                # not disappear automatically when the icon is reparented or
+                # deleted.  Force-unpin and hide it before destroying the
+                # annotation, otherwise a pinned window can remain visible.
+                if hasattr(widget, "_hide_hover_label"):
+                    widget._hide_hover_label(force=True)
                 widget.setParent(None)
                 widget.deleteLater()
                 self.annotation_widgets.remove(widget)
@@ -1631,6 +1842,14 @@ class PageView(QWidget):
                 height=img["height"],
                 parent=self.overlay,
             )
+            # Explain Mode lets the extracted text layer receive gestures even
+            # when the PDF also exposes a full-page image hit region.  Apply
+            # the state here as well as in PdfScrollView.set_explain_mode so
+            # widgets rebuilt after zooming keep the same event policy.
+            iw.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents,
+                self.explain_mode,
+            )
             iw.image_clicked.connect(self.image_clicked)
             iw.show()
             self.image_hit_widgets.append(iw)
@@ -1661,7 +1880,15 @@ class PageView(QWidget):
         self.selected_widgets.add(widget)
         self._update_selection_preview()
         self._update_selection_strips()
-        self.overlay.grabMouse()
+        app = QApplication.instance()
+        if app is not None and not self._selection_app_filter_installed:
+            # Explain Mode already installs this PageView as an application
+            # filter for Ctrl-drag capture.  Reuse that filter instead of
+            # registering the same QObject twice; otherwise finishing text
+            # selection could remove the region-capture filter as well.
+            if not self._region_filter_installed:
+                app.installEventFilter(self)
+            self._selection_app_filter_installed = True
 
     def add_to_selection(self, widget: WordWidget):
         if widget not in self.selected_widgets:
@@ -1688,10 +1915,7 @@ class PageView(QWidget):
 
     def finish_selection(self, global_pos):
         self.selection_active = False
-        try:
-            self.overlay.releaseMouse()
-        except Exception:
-            pass
+        self._remove_selection_event_filter()
         if not self.selected_widgets:
             return
 
@@ -1825,6 +2049,7 @@ class PageView(QWidget):
 
     def clear_selection(self):
         self.selection_active = False
+        self._remove_selection_event_filter()
         for w in self.selected_widgets:
             w.set_selected(False)
         self.selected_widgets.clear()
@@ -1834,10 +2059,92 @@ class PageView(QWidget):
             w.setParent(None)
             w.deleteLater()
         self.selection_strip_widgets.clear()
+
+    def _remove_selection_event_filter(self):
+        """Stop receiving global mouse events after a text gesture ends."""
+        if not self._selection_app_filter_installed:
+            return
+        self._selection_app_filter_installed = False
+        # Keep the Explain Mode filter alive for Ctrl-drag gestures.  It is
+        # removed by set_explain_mode(False) when the mode is actually left.
+        if self._region_filter_installed:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except RuntimeError:
+                # QApplication may already be shutting down.
+                pass
+
+    @staticmethod
+    def _mouse_event_global_pos(event):
+        """Return a QMouseEvent's global position across Qt6 event variants."""
         try:
-            self.overlay.releaseMouse()
-        except Exception:
-            pass
+            return event.globalPosition().toPoint()
+        except AttributeError:
+            try:
+                return event.globalPos()
+            except AttributeError:
+                return None
+
+    def eventFilter(self, watched, event):
+        """Keep Explain gestures and text selection alive across child widgets."""
+        # This filter is installed on QApplication only for the duration of
+        # an active rectangle gesture.  The initial Ctrl press is handled by
+        # WordWidget/ImageHitWidget/overlay directly; this filter only keeps
+        # movement and release alive after the pointer crosses child widgets.
+        if self._region_filter_installed and self.explain_mode and self.isVisible():
+            event_type = event.type()
+            if event_type in (
+                QEvent.Type.WindowDeactivate,
+                QEvent.Type.ApplicationDeactivate,
+            ):
+                if self._region_selecting:
+                    self._cancel_region_selection()
+            if event_type in (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseMove,
+                QEvent.Type.MouseButtonRelease,
+            ):
+                global_pos = self._event_global_pos(event)
+                if global_pos is not None:
+                    if self._region_selecting:
+                        if event_type == QEvent.Type.MouseMove:
+                            self._update_region_selection(global_pos)
+                            return True
+                        if (
+                            event_type == QEvent.Type.MouseButtonRelease
+                            and event.button() == Qt.MouseButton.LeftButton
+                        ):
+                            self._finish_region_selection(global_pos)
+                            return True
+
+        if self.selection_active:
+            event_type = event.type()
+            if event_type == QEvent.Type.MouseMove:
+                global_pos = self._mouse_event_global_pos(event)
+                if global_pos is not None:
+                    target = self.widget_at_global(global_pos)
+                    if isinstance(target, WordWidget):
+                        self.add_to_selection(target)
+            elif (
+                event_type == QEvent.Type.MouseButtonRelease
+                and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton
+            ):
+                global_pos = self._mouse_event_global_pos(event)
+                if global_pos is not None:
+                    self.finish_selection(global_pos)
+            # Do not treat every Hide event as cancellation: selection-strip
+            # widgets are rebuilt on every move and their Hide events are
+            # delivered through this application filter.  Cancelling on that
+            # event would end a perfectly valid drag after the first word.
+            elif event_type in (
+                QEvent.Type.WindowDeactivate,
+                QEvent.Type.ApplicationDeactivate,
+            ):
+                self.clear_selection()
+        return super().eventFilter(watched, event)
 
     def _update_selection_preview(self):
         if not self.selected_widgets:

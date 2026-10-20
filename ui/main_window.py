@@ -4,6 +4,7 @@ VSCode-style layout: Activity Bar + Sidebar + Tabbed Main Area + Right Vocab Pan
 """
 import json
 import os
+import threading
 from PySide6.QtCore import Qt, QThread, Signal as QSignal, QTimer, QPoint, QSize
 from PySide6.QtGui import QAction, QKeySequence, QIcon, QCursor
 from PySide6.QtWidgets import (
@@ -92,13 +93,45 @@ class ExplainQueryWorker(QThread):
         self.timer_data = timer_data or {}
         self._first_chunk_emitted = False
         self.cancelled = False
+        # A worker can outlive its popup while a provider is still waiting for
+        # a response.  Keep cancellation separate from the Qt object lifetime
+        # so the GUI can detach its signals immediately without touching
+        # widgets from this thread.
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        """Request cancellation and stop delivering any further chunks."""
+        self.cancelled = True
+        self._cancel_event.set()
+        self.requestInterruption()
+
+    def is_cancelled(self) -> bool:
+        return self.cancelled or self._cancel_event.is_set() or self.isInterruptionRequested()
 
     def run(self):
         import time
         self.timer_data["worker_start"] = time.perf_counter()
-        full_text = ""
+        full_chunks = []
         try:
+            if self.is_cancelled():
+                return
             if self.streaming:
+                pending_chunks = []
+                pending_chars = 0
+                last_emit = time.perf_counter()
+
+                def emit_pending(force: bool = False):
+                    nonlocal pending_chars, last_emit
+                    if not pending_chunks:
+                        return
+                    now = time.perf_counter()
+                    if not force and pending_chars < 2048 and now - last_emit < 0.04:
+                        return
+                    self.chunk_ready.emit("".join(pending_chunks))
+                    pending_chunks.clear()
+                    pending_chars = 0
+                    last_emit = now
+
                 for chunk in api_client.explain_chat_stream(
                     self.messages,
                     self.provider["base_url"],
@@ -107,19 +140,28 @@ class ExplainQueryWorker(QThread):
                     self.provider.get("proxy", ""),
                     float(self.provider.get("temperature", 0.7)),
                     int(self.provider.get("max_tokens", 4096)),
+                    cancel_event=self._cancel_event,
                 ):
+                    if self.is_cancelled():
+                        return
                     if not self._first_chunk_emitted:
                         self.timer_data["first_chunk"] = time.perf_counter()
                         self._first_chunk_emitted = True
                     if chunk.startswith("Error:"):
+                        emit_pending(force=True)
                         self.result_ready.emit(chunk)
                         return
                     if chunk:
-                        full_text += chunk
-                        self.chunk_ready.emit(chunk)
+                        full_chunks.append(chunk)
+                        pending_chunks.append(chunk)
+                        pending_chars += len(chunk)
+                        emit_pending()
+                emit_pending(force=True)
                 self.timer_data["result_ready"] = time.perf_counter()
-                self.result_ready.emit(full_text)
+                self.result_ready.emit("".join(full_chunks))
             else:
+                if self.is_cancelled():
+                    return
                 result = api_client.explain_chat(
                     self.messages,
                     self.provider["base_url"],
@@ -504,6 +546,7 @@ class MainWindow(QMainWindow):
         tab.scroll_view.words_collected.connect(self._on_words_collected)
         tab.scroll_view.explain_requested.connect(self._on_explain_requested)
         tab.scroll_view.image_clicked.connect(self._on_image_explain_requested)
+        tab.scroll_view.image_region_selected.connect(self._on_image_region_explain_requested)
         tab.scroll_view.page_double_clicked.connect(self._on_page_double_clicked)
         tab.scroll_view.link_clicked.connect(self._on_link_clicked)
         tab.scroll_view.page_changed.connect(self.note_panel.on_page_changed)
@@ -699,9 +742,8 @@ class MainWindow(QMainWindow):
                 self._explain_popup.hide()
                 self._explain_popup = None
             if tab._explain_worker is not None:
-                tab._explain_worker.cancelled = True
+                self._cancel_explain_worker(tab._explain_worker)
                 tab._explain_worker = None
-                # Let old worker finish naturally; do NOT terminate() or disconnect()
             self.status_label.setText("Explain Mode: OFF")
 
     def _toggle_note_mode(self, checked: bool):
@@ -931,9 +973,8 @@ class MainWindow(QMainWindow):
         # If a previous worker is still running, force-terminate it so the user
         # can immediately start a new explanation without waiting.
         if tab._explain_worker is not None:
-            tab._explain_worker.cancelled = True
+            self._cancel_explain_worker(tab._explain_worker)
             tab._explain_worker = None
-            # Let old worker finish naturally; do NOT terminate() or disconnect()
         if self._explain_popup:
             self._explain_popup.hide()
             self._explain_popup = None
@@ -1014,9 +1055,37 @@ class MainWindow(QMainWindow):
         # Kept for compatibility; actual cleanup is done in on_finished closure
         pass
 
+    @staticmethod
+    def _cancel_explain_worker(worker):
+        """Detach a worker from the GUI and request prompt cancellation.
+
+        Network reads may take a while to time out, so merely setting a flag
+        leaves a running thread and a queue of chunk signals behind.  Detach
+        the high-volume result signals first, then request cancellation.  The
+        worker's ``finished`` signal remains connected for normal bookkeeping.
+        """
+        if worker is None:
+            return
+        for signal_name in ("chunk_ready", "result_ready"):
+            signal = getattr(worker, signal_name, None)
+            if signal is not None:
+                try:
+                    signal.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        cancel = getattr(worker, "cancel", None)
+        if cancel is not None:
+            cancel()
+        else:
+            worker.cancelled = True
+
     def _on_explain_follow_up(self, text: str, tab, popup):
         if tab._explain_worker is not None:
             return
+        if hasattr(popup, "prepare_follow_up_save"):
+            popup.prepare_follow_up_save()
+        else:
+            popup.saved_annotation_id = None
         tab.explain_messages.append({"role": "user", "content": text})
         provider = database.get_default_ai_provider()
         if not provider:
@@ -1099,6 +1168,37 @@ class MainWindow(QMainWindow):
             prompt_key="prompt_explain_image",
             annotation_page_number=page_number,
             annotation_global_pos=QCursor.pos(),
+        )
+
+    def _on_image_region_explain_requested(self, page_number: int, image, global_pos):
+        """Explain a Ctrl-dragged screenshot region from the rendered page."""
+        import time
+        timer = {"start": time.perf_counter(), "type": f"Region(page={page_number})"}
+        tab = self._current_tab()
+        if tab is None or not tab.explain_mode or not tab.explain_ready:
+            return
+        if image is None or image.isNull():
+            return
+
+        self._clear_all_image_selections(tab)
+        timer["snapshot_done"] = time.perf_counter()
+        b64, mime = encode_qimage_to_base64(image, max_size=1024, quality=75)
+        timer["encode_done"] = time.perf_counter()
+        if not b64:
+            QMessageBox.warning(self, "Error", "Failed to encode selected image region.")
+            return
+
+        cfg = prompt_manager.get_prompt("prompt_explain_image")
+        self._run_explain_with_image(
+            tab,
+            text_prompt=cfg.get("user", "请解释这部分截图的内容和含义"),
+            image_b64=b64,
+            image_mime=mime,
+            display_title="[Image Region]",
+            timer_data=timer,
+            prompt_key="prompt_explain_image",
+            annotation_page_number=page_number,
+            annotation_global_pos=global_pos,
         )
 
     def _on_page_double_clicked(self, page_number: int):
@@ -1209,14 +1309,16 @@ class MainWindow(QMainWindow):
                     if aw.annotation_id == annotation_id:
                         aw.note_text = text
                         aw.note_format = "auto"
-                        if aw._hover_label is not None:
-                            aw._hover_label.hide()
+                        if hasattr(aw, "_hide_hover_label"):
+                            aw._hide_hover_label(force=True)
                 for hw in pv.highlight_widgets:
                     annot = database.get_annotation_for_target(
                         tab.pdf_path, "highlight", hw.highlight_id
                     )
                     if annot and annot["id"] == annotation_id:
                         hw.set_annotation_text(text, "auto")
+                        if hw._hover_label is not None:
+                            hw._hover_label.hide()
         self.status_label.setText("Annotation saved.")
 
     def _do_annotation_delete(self, annotation_id: int):
@@ -1226,6 +1328,17 @@ class MainWindow(QMainWindow):
         if tab and tab.scroll_view:
             for pv in tab.scroll_view.page_views:
                 pv.remove_annotation_widget(annotation_id)
+                # An annotation can also belong to a text highlight. Clear
+                # that viewer as well; its hover browser is a separate child
+                # of the page overlay just like an icon's browser.
+                for hw in pv.highlight_widgets:
+                    annot = database.get_annotation_for_target(
+                        tab.pdf_path, "highlight", hw.highlight_id
+                    )
+                    if annot and annot["id"] == annotation_id:
+                        if hw._hover_label is not None:
+                            hw._hover_label.hide()
+                        hw.set_annotation_text("", "auto")
         self.status_label.setText("Annotation deleted.")
 
     def _on_annotation_hover_show(self, annot_id: int, text: str, global_pos):
@@ -1292,9 +1405,8 @@ class MainWindow(QMainWindow):
 
         # Terminate previous worker
         if tab._explain_worker is not None:
-            tab._explain_worker.cancelled = True
+            self._cancel_explain_worker(tab._explain_worker)
             tab._explain_worker = None
-            # Let old worker finish naturally; do NOT terminate() or disconnect()
         if self._explain_popup:
             self._explain_popup.hide()
             self._explain_popup = None
@@ -1410,6 +1522,53 @@ class MainWindow(QMainWindow):
             pass
         return default_width, default_height
 
+    @staticmethod
+    def _annotation_position_without_overlap(page_view, local_x: int, local_y: int):
+        """Find a nearby 24px icon position that does not cover another icon."""
+        icon_size = 24
+        max_x = max(0, page_view.overlay.width() - icon_size)
+        max_y = max(0, page_view.overlay.height() - icon_size)
+        base_x = max(0, min(int(local_x), max_x))
+        base_y = max(0, min(int(local_y), max_y))
+        occupied = [widget.geometry() for widget in page_view.annotation_widgets]
+
+        def is_free(x: int, y: int) -> bool:
+            for rect in occupied:
+                if (
+                    x < rect.x() + rect.width()
+                    and x + icon_size > rect.x()
+                    and y < rect.y() + rect.height()
+                    and y + icon_size > rect.y()
+                ):
+                    return False
+            return True
+
+        # Try the anchor first, then expand in square rings.  The search stays
+        # close to the source location while handling repeated follow-up saves
+        # and existing manually placed icons on the same page.
+        step = 32
+        max_radius = max(max_x, max_y) // step + 2
+        seen = set()
+        for radius in range(max_radius + 1):
+            points = []
+            if radius == 0:
+                points.append((0, 0))
+            else:
+                for offset in range(-radius, radius + 1):
+                    points.extend(((offset, -radius), (offset, radius)))
+                for offset in range(-radius + 1, radius):
+                    points.extend(((-radius, offset), (radius, offset)))
+            for dx, dy in points:
+                x = max(0, min(base_x + dx * step, max_x))
+                y = max(0, min(base_y + dy * step, max_y))
+                key = (x, y)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if is_free(x, y):
+                    return x, y
+        return base_x, base_y
+
     def _create_explain_annotation(self, tab, popup, explanation: str):
         """Create or update the icon attached to an Explain response."""
         page_view = self._annotation_page_view(tab, popup)
@@ -1432,7 +1591,10 @@ class MainWindow(QMainWindow):
                         if widget._hover_label is not None:
                             widget._hover_label._saved_hover_size = widget.hover_size
                     if widget._hover_label is not None:
-                        widget._hover_label.hide()
+                        if hasattr(widget, "_hide_hover_label"):
+                            widget._hide_hover_label(force=True)
+                        else:
+                            widget._hover_label.hide()
                     break
             return existing_id
 
@@ -1450,6 +1612,9 @@ class MainWindow(QMainWindow):
         max_y = max(0, page_view.overlay.height() - 24)
         local_x = max(0, min(local_x, max_x))
         local_y = max(0, min(local_y, max_y))
+        local_x, local_y = self._annotation_position_without_overlap(
+            page_view, local_x, local_y
+        )
         pdf_x = local_x / page_view.zoom
         pdf_y = local_y / page_view.zoom
         hover_width, hover_height = self._explain_hover_default_size()
@@ -1489,9 +1654,6 @@ class MainWindow(QMainWindow):
         annotation_id = None
         if popup is not None:
             annotation_id = self._create_explain_annotation(tab, popup, explanation)
-            if annotation_id is not None:
-                popup.btn_save.setText("Update")
-                popup.btn_save.setToolTip("Update this explanation annotation")
 
         if annotation_id is not None:
             self.status_label.setText("Explanation saved as an annotation.")
@@ -1503,9 +1665,8 @@ class MainWindow(QMainWindow):
     def _on_explain_popup_closed(self):
         tab = self._current_tab()
         if tab and tab._explain_worker is not None:
-            tab._explain_worker.cancelled = True
+            self._cancel_explain_worker(tab._explain_worker)
             tab._explain_worker = None
-            # Let old worker finish naturally; do NOT terminate() or disconnect()
         self._explain_popup = None
 
     # ------------------------------------------------------------------ #
