@@ -35,6 +35,7 @@ class BookmarkTreeWidget(QTreeWidget):
         self.itemClicked.connect(self._on_item_clicked)
 
         self._current_pdf = ""
+        self._current_page = 0
 
     def set_pdf(self, pdf_path: str):
         """Load bookmarks for the given PDF."""
@@ -87,6 +88,31 @@ class BookmarkTreeWidget(QTreeWidget):
         if data and data.get("entry_type", "bookmark") == "bookmark":
             self.bookmark_clicked.emit(data["page_number"])
 
+    def keyPressEvent(self, event):
+        """Use Enter as a shortcut for adding a child bookmark.
+
+        The selected tree item is the parent.  The child page is taken from
+        the PDF page currently selected in the reader.
+        """
+        if (
+            event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and self.state() != QAbstractItemView.State.EditingState
+        ):
+            item = self.currentItem()
+            if item is not None:
+                self._add_child_item(item, "bookmark")
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def set_current_page(self, page_number: int):
+        """Store the PDF page that new child bookmarks should use."""
+        try:
+            self._current_page = max(0, int(page_number))
+        except (TypeError, ValueError):
+            self._current_page = 0
+
     def _show_context_menu(self, pos):
         """Show right-click context menu."""
         item = self.itemAt(pos)
@@ -103,6 +129,9 @@ class BookmarkTreeWidget(QTreeWidget):
         )
 
         if item:
+            # A context-menu invocation should also make the clicked item the
+            # active selection, so a subsequent Enter has the same parent.
+            self.setCurrentItem(item)
             data = item.data(0, Qt.ItemDataRole.UserRole)
             entry_type = data.get("entry_type", "bookmark")
             act_rename = menu.addAction("✏️ Rename")
@@ -157,9 +186,12 @@ class BookmarkTreeWidget(QTreeWidget):
         label = "Keyword text:" if entry_type == "keyword" else "Bookmark title:"
         title, ok = QInputDialog.getText(self, dialog_title, label)
         if ok and title.strip():
+            # Use the page currently selected in the reader.  The old
+            # placeholder value (0) made every child point to page 1.
+            page_number = self._current_page if entry_type == "bookmark" else 0
             database.add_bookmark(
                 self._current_pdf,
-                0,  # page_number placeholder
+                page_number,
                 title.strip(),
                 parent_id=parent_data["id"],
                 entry_type=entry_type
@@ -326,7 +358,11 @@ class BookmarkPanel(QWidget):
 
     def set_current_page(self, page_number: int):
         """Update the current page number for 'Add Current Page' button."""
-        self._current_page = page_number
+        try:
+            self._current_page = max(0, int(page_number))
+        except (TypeError, ValueError):
+            self._current_page = 0
+        self.tree.set_current_page(self._current_page)
 
     def _on_add_current_page(self):
         """Request to add a bookmark for the current page."""
